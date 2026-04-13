@@ -1,0 +1,522 @@
+import { 
+    RuntimeGraph, RuntimeNode,
+    BeetleRankUserSnapshot, RacerRuntimeState,
+    FlowNodeType 
+} from './types';
+
+export class RacerProgressResolver {
+    private static readonly ReanchorRadiusFactor = 0.5; // Increased for better self-healing
+    private static readonly ReanchorRadiusMax = 10.0; // Increased for better self-healing
+    private static readonly HysteresisRadiusFactor = 1.2; // Stay inside a bit longer to prevent flickering
+
+    public initializeAtStart(graph: RuntimeGraph, racer: RacerRuntimeState): void {
+        const firstStart = graph.nodes.find((n: RuntimeNode) => n.nodeType === FlowNodeType.Start);
+        if (!firstStart) {
+            console.error("Graph has no start node.");
+            return;
+        }
+
+        racer.lastConfirmedNode = firstStart;
+        const firstEdge = graph.edges.find((e: any) => e.fromNodeId === firstStart.id);
+        racer.currentTargetNode = firstEdge ? graph.nodes.find((n: RuntimeNode) => n.id === (firstEdge as any).toNodeId) || null : null;
+        racer.edgeProgress = 0;
+        racer.totalProgress = 0;
+        racer.statusText = "Initialized";
+        racer.hasFinished = false;
+        racer.awaitingBranchDecision = false;
+        racer.pendingSplitNode = null;
+        racer.candidateBranchEntryNodes = [];
+        racer.activeBranchRootNode = null;
+        racer.activeBranchEntryNode = null;
+        racer.branchLocked = false;
+        racer.branchLockReason = "";
+        racer.confirmedNodes = [];
+        racer.skippedNodes = [];
+        racer.confirmationHistory = [];
+        racer.nodeProgress = new Map<string, number>();
+        
+        this.addHistory(racer, firstStart);
+    }
+
+    public applyTelemetry(graph: RuntimeGraph, racer: RacerRuntimeState, sample: BeetleRankUserSnapshot): void {
+        racer.isActive = sample.active;
+        racer.lastUpdateUtc = Date.now();
+
+        if (!racer.lastConfirmedNode) {
+            // Attempt to re-anchor first before initializing at start
+            const reanchorNode = this.findBestReanchorNode(graph, sample);
+            if (reanchorNode) {
+                console.log(`[Resolver] Initializing "${racer.racerName}" via re-anchor to ${reanchorNode.label}`);
+                this.reanchorToNode(graph, racer, reanchorNode);
+            } else {
+                console.log(`[Resolver] Initializing "${racer.racerName}" at start.`);
+                this.initializeAtStart(graph, racer);
+            }
+        }
+
+        if (!racer.lastConfirmedNode) {
+            return;
+        }
+
+        // Global strict re-anchor pass
+        const reanchorNode = this.findBestReanchorNode(graph, sample);
+        if (reanchorNode) {
+            // Only re-anchor if it represents progress (higher index) 
+            // OR if the distance to current target is significantly worse than reanchorNode
+            const currentIndex = racer.lastConfirmedNode?.index ?? -1;
+            
+            let shouldReanchor = reanchorNode.index > currentIndex;
+
+            // Self-healing: if we are far from our current path, re-anchor even if index is lower
+            if (!shouldReanchor) {
+                const distToLast = this.distance3D(sample.x, sample.y, sample.z, racer.lastConfirmedNode.worldX, racer.lastConfirmedNode.worldY, racer.lastConfirmedNode.worldZ);
+                const distToTarget = racer.currentTargetNode ? this.distance3D(sample.x, sample.y, sample.z, racer.currentTargetNode.worldX, racer.currentTargetNode.worldY, racer.currentTargetNode.worldZ) : Infinity;
+                
+                const currentPathDist = Math.min(distToLast, distToTarget);
+                const reanchorRadius = this.getReanchorRadius(reanchorNode);
+                
+                // If we are more than 3x the reanchor radius away from our current path, but inside another trigger, 
+                // OR we are at index 0 (initial start) but found a later checkpoint (handled by reanchorNode.index > currentIndex above)
+                if (currentPathDist > reanchorRadius * 3) {
+                    shouldReanchor = true;
+                    console.log(`[Resolver] Self-healing "${racer.racerName}" to ${reanchorNode.label} (Current path distance: ${currentPathDist.toFixed(2)})`);
+                }
+            }
+
+            if (shouldReanchor) {
+                console.log(`[Resolver] Re-anchoring "${racer.racerName}" to ${reanchorNode.label} (ID: ${reanchorNode.id}, Index: ${reanchorNode.index})`);
+                this.reanchorToNode(graph, racer, reanchorNode);
+                return;
+            }
+        }
+
+        // Handle pending split decision
+        if (racer.awaitingBranchDecision && racer.pendingSplitNode) {
+            this.handlePendingSplitDecision(graph, racer, sample);
+            return;
+        }
+
+        if (!racer.currentTargetNode) {
+            if (!racer.hasFinished) {
+                racer.statusText = "No target node";
+                console.log(`[Resolver] "${racer.racerName}" has no target node.`);
+            }
+            return;
+        }
+
+        // Normal forward confirmation
+        if (this.isInsideTrigger(sample, racer.currentTargetNode)) {
+            console.log(`[Resolver] "${racer.racerName}" confirmed node ${racer.currentTargetNode.label}`);
+            this.confirmNode(graph, racer, racer.currentTargetNode, `Confirmed ${racer.currentTargetNode.label}`);
+            return;
+        }
+
+        // Update interpolated progress
+        racer.edgeProgress = this.computeEdgeProgress(racer.lastConfirmedNode, racer.currentTargetNode, sample);
+        this.updateTotalProgress(graph, racer);
+        racer.statusText = `Moving toward ${racer.currentTargetNode.label}`;
+    }
+
+    private updateTotalProgress(graph: RuntimeGraph, racer: RacerRuntimeState): void {
+        if (racer.hasFinished) {
+            racer.totalProgress = 1.0;
+            return;
+        }
+
+        if (!racer.lastConfirmedNode) {
+            racer.totalProgress = 0;
+            return;
+        }
+
+        const currentSegmentNodes = graph.nodes.filter(n => 
+            n.sectionIndex === racer.lastConfirmedNode!.sectionIndex && 
+            n.segmentIndex === racer.lastConfirmedNode!.segmentIndex
+        );
+
+        let segmentStartNode = currentSegmentNodes.find(n => n.nodeType === FlowNodeType.Start);
+        let segmentEndNode = currentSegmentNodes.find(n => n.nodeType === FlowNodeType.End || n.nodeType === FlowNodeType.Boss || n.isEndOfRace);
+
+        // Fallback to global start/finish if not found in current segment (should ideally not happen with correct map)
+        if (!segmentStartNode) segmentStartNode = graph.startNodes[0];
+        if (!segmentEndNode) segmentEndNode = graph.finishNodes[0];
+        
+        if (!segmentStartNode || !segmentEndNode) {
+            racer.totalProgress = 0;
+            return;
+        }
+
+        const maxIndex = segmentEndNode.index;
+        const startIndex = segmentStartNode.index;
+        const totalIndexRange = maxIndex - startIndex;
+
+        if (totalIndexRange <= 0) {
+            racer.totalProgress = 0;
+            return;
+        }
+
+        const lastIndex = racer.lastConfirmedNode.index;
+        const targetIndex = racer.currentTargetNode ? racer.currentTargetNode.index : lastIndex;
+
+        let currentSmoothIndex = lastIndex;
+        
+        // Only interpolate if we are in the same segment
+        const isSameSegment = racer.currentTargetNode && 
+                              racer.currentTargetNode.sectionIndex === racer.lastConfirmedNode.sectionIndex &&
+                              racer.currentTargetNode.segmentIndex === racer.lastConfirmedNode.segmentIndex;
+
+        if (isSameSegment && targetIndex > lastIndex) {
+            currentSmoothIndex = lastIndex + (targetIndex - lastIndex) * racer.edgeProgress;
+        }
+
+        racer.totalProgress = (currentSmoothIndex - startIndex) / totalIndexRange;
+        
+        // Ensure totalProgress is within bounds
+        racer.totalProgress = Math.max(0, Math.min(1.0, racer.totalProgress));
+    }
+
+    private confirmNode(graph: RuntimeGraph, racer: RacerRuntimeState, confirmedNode: RuntimeNode, statusText: string): void {
+        racer.lastConfirmedNode = confirmedNode;
+        this.addHistory(racer, confirmedNode);
+
+        if (!racer.confirmedNodes) {
+            racer.confirmedNodes = [];
+        }
+        
+        if (!racer.skippedNodes) {
+            racer.skippedNodes = [];
+        }
+
+        if (!racer.confirmedNodes.includes(confirmedNode.id)) {
+            racer.confirmedNodes.push(confirmedNode.id);
+        } else {
+            // Even if already in confirmedNodes, it might have been marked as skipped previously 
+            // but now we actually TRIGGERED it. So remove it from skippedNodes if it was there.
+            const skippedIndex = racer.skippedNodes.indexOf(confirmedNode.id);
+            if (skippedIndex !== -1) {
+                racer.skippedNodes.splice(skippedIndex, 1);
+            }
+        }
+
+        // Re-evaluate skipped nodes when a node is confirmed
+        const checkpoints = graph.nodes
+            .filter(n => n.nodeType === FlowNodeType.Checkpoint || n.nodeType === FlowNodeType.Start || n.nodeType === FlowNodeType.End || n.nodeType === FlowNodeType.Boss)
+            .filter(n => {
+                // Node is globally before confirmedNode
+                if (n.sectionIndex < confirmedNode.sectionIndex) return true;
+                if (n.sectionIndex === confirmedNode.sectionIndex && n.segmentIndex < confirmedNode.segmentIndex) return true;
+                if (n.sectionIndex === confirmedNode.sectionIndex && n.segmentIndex === confirmedNode.segmentIndex && n.index < confirmedNode.index) return true;
+                return false;
+            });
+
+        for (const node of checkpoints) {
+            // Check if there is a path from this node to the confirmedNode
+            // If so, it must have been passed/skipped
+            if (this.canReach(graph, node.id, confirmedNode.id)) {
+                if (!racer.confirmedNodes.includes(node.id)) {
+                    racer.confirmedNodes.push(node.id);
+                }
+                if (!racer.skippedNodes.includes(node.id)) {
+                    racer.skippedNodes.push(node.id);
+                }
+            }
+        }
+
+        if (confirmedNode.nodeType === FlowNodeType.Converge) {
+            this.clearBranchLock(racer);
+        }
+
+        if (confirmedNode.nodeType === FlowNodeType.Split) {
+            this.enterPendingSplit(graph, racer, confirmedNode);
+            racer.currentTargetNode = null;
+            racer.edgeProgress = 0;
+            racer.statusText = `${statusText} - awaiting branch decision`;
+            return;
+        }
+
+        const outgoing = graph.edges.filter((e: any) => e.fromNodeId === confirmedNode.id);
+        if (outgoing.length === 0) {
+            racer.currentTargetNode = null;
+            racer.edgeProgress = 1.0;
+            racer.hasFinished = true;
+            racer.totalProgress = 1.0;
+            racer.statusText = "Finished";
+            return;
+        }
+
+        const nextEdge = outgoing[0];
+        racer.currentTargetNode = graph.nodes.find((n: RuntimeNode) => n.id === (nextEdge as any).toNodeId) || null;
+        racer.edgeProgress = 0;
+        this.updateTotalProgress(graph, racer);
+        racer.statusText = statusText;
+    }
+
+    private handlePendingSplitDecision(graph: RuntimeGraph, racer: RacerRuntimeState, sample: BeetleRankUserSnapshot): void {
+        for (const candidate of racer.candidateBranchEntryNodes) {
+            if (this.isInsideTrigger(sample, candidate)) {
+                racer.lastConfirmedNode = candidate;
+                this.addHistory(racer, candidate);
+                
+                if (!racer.confirmedNodes.includes(candidate.id)) {
+                    racer.confirmedNodes.push(candidate.id);
+                }
+
+                // If this candidate was marked as skipped (due to re-anchor/jump), remove it from skipped
+                if (racer.skippedNodes) {
+                    const skippedIndex = racer.skippedNodes.indexOf(candidate.id);
+                    if (skippedIndex !== -1) {
+                        racer.skippedNodes.splice(skippedIndex, 1);
+                    }
+                }
+
+                racer.activeBranchRootNode = racer.pendingSplitNode;
+                racer.activeBranchEntryNode = candidate;
+                racer.branchLocked = true;
+                racer.branchLockReason = `Locked by first child checkpoint ${candidate.label}`;
+
+                this.clearPendingSplit(racer);
+
+                const outgoing = graph.edges.filter((e: any) => e.fromNodeId === candidate.id);
+                if (outgoing.length === 0) {
+                    racer.currentTargetNode = null;
+                    racer.edgeProgress = 1.0;
+                    racer.hasFinished = true;
+                    racer.statusText = "Finished";
+                    return;
+                }
+
+                const nextEdge = outgoing[0];
+                racer.currentTargetNode = graph.nodes.find((n: RuntimeNode) => n.id === (nextEdge as any).toNodeId) || null;
+                racer.edgeProgress = 0;
+                racer.statusText = `Branch confirmed at ${candidate.label}`;
+                return;
+            }
+        }
+
+        racer.statusText = `Awaiting branch decision at ${racer.pendingSplitNode?.label}`;
+    }
+
+    private findBestReanchorNode(graph: RuntimeGraph, sample: BeetleRankUserSnapshot): RuntimeNode | null {
+        let bestNode: RuntimeNode | null = null;
+        let bestDistance = Infinity;
+
+        for (const node of graph.nodes) {
+            if (!node.isBound) continue;
+            
+            // Check if it's a checkpoint or start/end
+            if (node.nodeType !== FlowNodeType.Checkpoint && 
+                node.nodeType !== FlowNodeType.Start && 
+                node.nodeType !== FlowNodeType.End &&
+                node.nodeType !== FlowNodeType.Boss) {
+                continue;
+            }
+
+            const sampleMap = Number(sample.map);
+            if (node.mapId !== null && node.mapId !== sampleMap) {
+                continue;
+            }
+
+            const dist = this.distance3D(sample.x, sample.y, sample.z, node.worldX, node.worldY, node.worldZ);
+            const reanchorRadius = this.getReanchorRadius(node);
+
+            // Favor higher indices if multiple nodes are within range
+            if (dist <= reanchorRadius) {
+                if (!bestNode || node.index > bestNode.index || (node.index === bestNode.index && dist < bestDistance)) {
+                    bestDistance = dist;
+                    bestNode = node;
+                }
+            }
+        }
+
+        return bestNode;
+    }
+
+    private reanchorToNode(graph: RuntimeGraph, racer: RacerRuntimeState, node: RuntimeNode): void {
+        this.clearPendingSplit(racer);
+
+        // Rebuild lock state based on where we landed.
+        this.rebuildBranchStateForNode(graph, racer, node);
+
+        racer.lastConfirmedNode = node;
+        this.addHistory(racer, node);
+        
+        if (!racer.confirmedNodes.includes(node.id)) {
+            racer.confirmedNodes.push(node.id);
+        }
+
+        // If we re-anchored to a node that was previously marked as skipped, unmark it
+        if (racer.skippedNodes) {
+            const skippedIndex = racer.skippedNodes.indexOf(node.id);
+            if (skippedIndex !== -1) {
+                racer.skippedNodes.splice(skippedIndex, 1);
+            }
+        }
+
+        if (node.nodeType === FlowNodeType.Split) {
+            this.enterPendingSplit(graph, racer, node);
+            racer.currentTargetNode = null;
+            racer.edgeProgress = 0;
+            racer.statusText = `Re-anchored to split ${node.label} - awaiting branch decision`;
+            return;
+        }
+
+        const outgoing = graph.edges.filter((e: any) => e.fromNodeId === node.id);
+        if (outgoing.length === 0) {
+            racer.currentTargetNode = null;
+            racer.edgeProgress = 1.0;
+            racer.hasFinished = true;
+            racer.statusText = `Re-anchored to finish node ${node.label}`;
+            return;
+        }
+
+        const nextEdge = outgoing[0];
+        racer.currentTargetNode = graph.nodes.find((n: RuntimeNode) => n.id === (nextEdge as any).toNodeId) || null;
+        racer.edgeProgress = 0;
+        racer.statusText = `Re-anchored to ${node.label}`;
+    }
+
+    private rebuildBranchStateForNode(graph: RuntimeGraph, racer: RacerRuntimeState, node: RuntimeNode): void {
+        this.clearBranchLock(racer);
+
+        const incomingEdges = node.incoming;
+        // If this is a direct child of a split, it is a branch-entry checkpoint.
+        if (incomingEdges.length === 1) {
+            const edge = incomingEdges[0];
+            const fromNode = graph.nodes.find(n => n.id === edge.fromNodeId);
+            if (fromNode?.nodeType === FlowNodeType.Split) {
+                racer.activeBranchRootNode = fromNode;
+                racer.activeBranchEntryNode = node;
+                racer.branchLocked = true;
+                racer.branchLockReason = `Rebuilt from branch entry node ${node.label}`;
+                return;
+            }
+        }
+
+        // If deeper in a branch, walk backward to find a split ancestor.
+        const result = this.findNearestSplitAncestor(graph, node);
+        if (result) {
+            racer.activeBranchRootNode = result.splitNode;
+            racer.activeBranchEntryNode = result.entryNode;
+            racer.branchLocked = true;
+            racer.branchLockReason = `Rebuilt from descendant node ${node.label}`;
+        }
+    }
+
+    private findNearestSplitAncestor(graph: RuntimeGraph, node: RuntimeNode): { splitNode: RuntimeNode, entryNode: RuntimeNode } | null {
+        const visited = new Set<string>();
+        const queue: { node: RuntimeNode, firstDescendant: RuntimeNode | null }[] = [];
+
+        queue.push({ node, firstDescendant: null });
+
+        while (queue.length > 0) {
+            const current = queue.shift()!;
+            if (visited.has(current.node.id)) continue;
+            visited.add(current.node.id);
+
+            for (const edge of current.node.incoming) {
+                const parent = graph.nodes.find(n => n.id === edge.fromNodeId);
+                if (!parent) continue;
+
+                if (parent.nodeType === FlowNodeType.Split) {
+                    return { splitNode: parent, entryNode: current.node };
+                }
+
+                queue.push({ node: parent, firstDescendant: current.node });
+            }
+        }
+
+        return null;
+    }
+
+    private enterPendingSplit(graph: RuntimeGraph, racer: RacerRuntimeState, splitNode: RuntimeNode): void {
+        this.clearPendingSplit(racer);
+
+        racer.pendingSplitNode = splitNode;
+        racer.awaitingBranchDecision = true;
+
+        const outgoingEdges = graph.edges.filter(e => e.fromNodeId === splitNode.id);
+        for (const edge of outgoingEdges) {
+            const toNode = graph.nodes.find(n => n.id === edge.toNodeId);
+            if (toNode) {
+                racer.candidateBranchEntryNodes.push(toNode);
+            }
+        }
+    }
+
+    private addHistory(racer: RacerRuntimeState, node: RuntimeNode): void {
+        if (!racer.confirmationHistory) {
+            racer.confirmationHistory = [];
+        }
+        
+        if (racer.confirmationHistory.length === 0 || racer.confirmationHistory[racer.confirmationHistory.length - 1] !== node.id) {
+            racer.confirmationHistory.push(node.id);
+        }
+        
+        if (racer.confirmationHistory.length > 20) {
+            racer.confirmationHistory.shift();
+        }
+    }
+
+    private clearBranchLock(racer: RacerRuntimeState): void {
+        racer.activeBranchRootNode = null;
+        racer.activeBranchEntryNode = null;
+        racer.branchLocked = false;
+        racer.branchLockReason = "";
+    }
+
+    private clearPendingSplit(racer: RacerRuntimeState): void {
+        racer.pendingSplitNode = null;
+        racer.awaitingBranchDecision = false;
+        racer.candidateBranchEntryNodes = [];
+    }
+
+    private canReach(graph: RuntimeGraph, fromNodeId: string, toNodeId: string): boolean {
+        const visited = new Set<string>();
+        const queue = [fromNodeId];
+        visited.add(fromNodeId);
+
+        while (queue.length > 0) {
+            const currentId = queue.shift()!;
+            if (currentId === toNodeId) return true;
+
+            const outgoing = graph.edges.filter(e => e.fromNodeId === currentId);
+            for (const edge of outgoing) {
+                if (!visited.has(edge.toNodeId)) {
+                    visited.add(edge.toNodeId);
+                    queue.push(edge.toNodeId);
+                }
+            }
+        }
+        return false;
+    }
+
+    private isInsideTrigger(sample: BeetleRankUserSnapshot, node: RuntimeNode): boolean {
+        if (!node.isBound) return false;
+        if (node.mapId !== null && node.mapId !== Number(sample.map)) return false;
+
+        const dist = this.distance3D(sample.x, sample.y, sample.z, node.worldX, node.worldY, node.worldZ);
+        
+        // Apply hysteresis: if it's the current target, use a slightly larger radius to prevent flickering
+        const threshold = node.triggerRadius * RacerProgressResolver.HysteresisRadiusFactor;
+        return dist <= threshold;
+    }
+
+    private computeEdgeProgress(from: RuntimeNode, to: RuntimeNode, sample: BeetleRankUserSnapshot): number {
+        const totalDist = this.distance3D(from.worldX, from.worldY, from.worldZ, to.worldX, to.worldY, to.worldZ);
+        if (totalDist < 0.001) return 0;
+
+        const distToTarget = this.distance3D(sample.x, sample.y, sample.z, to.worldX, to.worldY, to.worldZ);
+
+        // Progress is 1.0 when at target, and decreases as we move away.
+        // If distance to target is equal to total distance, we are at the start node (0.0).
+        // If distance to target is larger than total distance, progress will be negative (walking backwards).
+        return 1.0 - (distToTarget / totalDist);
+    }
+
+    private getReanchorRadius(node: RuntimeNode): number {
+        return Math.min(node.triggerRadius * RacerProgressResolver.ReanchorRadiusFactor, RacerProgressResolver.ReanchorRadiusMax);
+    }
+
+    private distance3D(x1: number, y1: number, z1: number, x2: number, y2: number, z2: number): number {
+        return Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2) + Math.pow(z2 - z1, 2));
+    }
+}
