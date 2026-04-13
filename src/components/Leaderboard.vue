@@ -510,6 +510,13 @@ const connectWebSocket = () => {
 };
 
 onMounted(() => {
+  const storedSession = localStorage.getItem('sessionCode');
+  if (storedSession) {
+    if (confirm(`Do you want to change your event ID (currently ${storedSession})?`)) {
+      resetSession();
+    }
+  }
+
   loadState();
   try {
     graph = parseFlowmap(flowmapJson);
@@ -523,15 +530,20 @@ onMounted(() => {
   // Connect if session code was loaded from storage
   if (sessionCode.value) {
     connectWebSocket();
+  } else {
+    // If no session code is set (e.g. wiped), make sure input is empty
+    sessionCodeInput.value = '';
   }
 });
 
 const resetSession = () => {
   localStorage.removeItem('sessionCode');
-  if (sessionCode.value) {
-     localStorage.removeItem(`racers_${sessionCode.value}`);
+  const currentSession = sessionCode.value || localStorage.getItem('sessionCode');
+  if (currentSession) {
+     localStorage.removeItem(`racers_${currentSession}`);
   }
   sessionCode.value = null;
+  sessionCodeInput.value = '';
   if (socket) {
     socket.close();
     socket = null;
