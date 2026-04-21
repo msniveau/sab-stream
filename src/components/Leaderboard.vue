@@ -402,6 +402,22 @@ const visibleRacers = computed(() => {
   return sortedRacers.value.filter(r => !r.isRemoved);
 });
 
+const stableVisibleRacers = computed(() => {
+  // We keep a stable order in the DOM to prevent iframe reloads when the visual order changes.
+  // We sort by racerKey to ensure the order is consistent regardless of telemetry/manual sort.
+  return Array.from(racers.value.values())
+    .filter(r => !r.isRemoved)
+    .sort((a, b) => a.racerKey.localeCompare(b.racerKey));
+});
+
+const racerOrderMap = computed(() => {
+  const orderMap: Record<string, number> = {};
+  visibleRacers.value.forEach((racer, index) => {
+    orderMap[racer.racerKey] = index;
+  });
+  return orderMap;
+});
+
 const gridStyle = computed(() => {
   const count = visibleRacers.value.length;
   if (count === 0) return {};
@@ -807,11 +823,12 @@ onUnmounted(() => {
 
       <div v-if="!connected && !error" class="connecting">Connecting to telemetry...</div>
       <div v-else class="grid-container" :class="{ 'has-fullscreen': !!fullscreenRacerKey }" :style="gridStyle">
-        <div v-for="racer in visibleRacers" :key="racer.racerKey" 
+        <div v-for="racer in stableVisibleRacers" :key="racer.racerKey" 
              class="grid-item" 
              :class="{ finished: racer.hasFinished, inactive: !racer.isActive, fullscreen: fullscreenRacerKey === racer.racerKey, hidden: !!fullscreenRacerKey && fullscreenRacerKey !== racer.racerKey }"
+             :style="{ order: racerOrderMap[racer.racerKey] }"
              @click="toggleFullscreen(racer.racerKey)">
-          <div class="iframe-container" :key="racer.racerKey">
+          <div class="iframe-container">
             <iframe 
               :src="getVdoNinjaUrl(racer.racerKey)" 
               frameborder="0" 
