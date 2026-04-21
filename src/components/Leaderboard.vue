@@ -15,9 +15,20 @@ const sessionCode = ref<string | null>(null);
 const isShowingPath = ref(false);
 const selectedSegmentIndex = ref(0);
 const racerIframeReloadKeys = ref<Record<string, number>>({});
+const windowSize = reactive({
+  width: window.innerWidth,
+  height: window.innerHeight
+});
+
+const handleResize = () => {
+  windowSize.width = window.innerWidth;
+  windowSize.height = window.innerHeight;
+};
 const error = ref<string | null>(null);
 const connected = ref(false);
 const sessionCodeInput = ref('');
+const isManualSort = ref(false);
+const manualOrder = ref<string[]>([]);
 
 // Load state from localStorage
 const loadState = () => {
@@ -147,30 +158,9 @@ const toggleFullscreen = (racerKey: string) => {
   }
 };
 
+
 const getDisplayName = (racerKey: string) => {
   return overrides.value[racerKey]?.displayName || racerKey;
-};
-
-const getVdoNinjaUrl = (racerKey: string) => {
-  const reloadKey = racerIframeReloadKeys.value[racerKey] || 0;
-  const overrideId = overrides.value[racerKey]?.vdoNinjaId;
-  let url = '';
-  if (overrideId) {
-    if (overrideId.startsWith('http')) {
-      url = overrideId;
-    } else {
-      url = `https://vdo.ninja/?view=${overrideId}&autoplay=1&mute=1`;
-    }
-  } else {
-    // Default logic: sanitize racerKey
-    const id = racerKey.replace(/\s+/g, '').toLowerCase();
-    url = `https://vdo.ninja/?view=${id}&autoplay=1&mute=1`;
-  }
-  
-  if (reloadKey > 0) {
-    url += (url.includes('?') ? '&' : '?') + `rk=${reloadKey}`;
-  }
-  return url;
 };
 
 const reloadStream = (racerKey: string, event: Event) => {
@@ -377,21 +367,124 @@ const flatSegmentGroups = computed(() => {
 });
 
 const sortedRacers = computed(() => {
-  return Array.from(racers.value.values())
-    .sort((a, b) => {
+  const allRacers = Array.from(racers.value.values());
+  
+  if (isManualSort.value && manualOrder.value.length > 0) {
+    // Return racers in the order they were when 'r' was pressed, 
+    // but handle new racers that might have appeared since then
+    const orderMap = new Map(manualOrder.value.map((key, index) => [key, index]));
+    
+    return allRacers.sort((a, b) => {
+      const indexA = orderMap.has(a.racerKey) ? orderMap.get(a.racerKey)! : 10000;
+      const indexB = orderMap.has(b.racerKey) ? orderMap.get(b.racerKey)! : 10000;
+      
+      if (indexA !== indexB) return indexA - indexB;
+      
+      // Fallback for racers not in manualOrder
       if (a.hasFinished && !b.hasFinished) return -1;
       if (!a.hasFinished && b.hasFinished) return 1;
-      
-      const aIdx = a.totalProgress;
-      const bIdx = b.totalProgress;
-      
-      return bIdx - aIdx;
+      return b.totalProgress - a.totalProgress;
     });
+  }
+
+  return allRacers.sort((a, b) => {
+    if (a.hasFinished && !b.hasFinished) return -1;
+    if (!a.hasFinished && b.hasFinished) return 1;
+    
+    const aIdx = a.totalProgress;
+    const bIdx = b.totalProgress;
+    
+    return bIdx - aIdx;
+  });
 });
 
 const visibleRacers = computed(() => {
   return sortedRacers.value.filter(r => !r.isRemoved);
 });
+
+const gridStyle = computed(() => {
+  const count = visibleRacers.value.length;
+  if (count === 0) return {};
+
+  // If one racer, take full screen
+  if (count === 1) {
+    return {
+      gridTemplateColumns: '1fr',
+      gridTemplateRows: '1fr'
+    };
+  }
+
+  // Calculate best grid layout (rows x cols) to minimize empty space and fit 16:9 aspect ratio
+  // viewport aspect ratio
+  const itemAspect = 16 / 9;
+
+  let bestCols = 1;
+  let maxItemSize = 0;
+
+  for (let cols = 1; cols <= count; cols++) {
+    const rows = Math.ceil(count / cols);
+    const itemWidth = windowSize.width / cols;
+    const itemHeight = itemWidth / itemAspect;
+
+    // If items at this width/height fit in the viewport
+    if (itemHeight * rows <= windowSize.height) {
+      if (itemWidth > maxItemSize) {
+        maxItemSize = itemWidth;
+        bestCols = cols;
+      }
+    } else {
+      // Items are too tall, limit by height
+      const altItemHeight = windowSize.height / rows;
+      const altItemWidth = altItemHeight * itemAspect;
+      if (altItemWidth > maxItemSize) {
+        maxItemSize = altItemWidth;
+        bestCols = cols;
+      }
+    }
+  }
+
+  return {
+    gridTemplateColumns: `repeat(${bestCols}, 1fr)`,
+    justifyContent: 'center',
+    alignContent: 'center',
+    width: '100%',
+    height: '100%',
+    gap: '4px'
+  };
+});
+
+// Cache for VDO Ninja URLs to prevent re-computing and causing iframe reloads
+const vdoNinjaUrlCache = new Map<string, string>();
+
+const getVdoNinjaUrl = (racerKey: string) => {
+  const reloadKey = racerIframeReloadKeys.value[racerKey] || 0;
+  const overrideId = overrides.value[racerKey]?.vdoNinjaId;
+  const cacheKey = `${racerKey}_${overrideId}_${reloadKey}`;
+  
+  if (vdoNinjaUrlCache.has(cacheKey)) {
+    return vdoNinjaUrlCache.get(cacheKey)!;
+  }
+
+  let url = '';
+  if (overrideId) {
+    if (overrideId.startsWith('http')) {
+      url = overrideId;
+    } else {
+      url = `https://vdo.ninja/?view=${overrideId}&autoplay=1&mute=1`;
+    }
+  } else {
+    // Default logic: sanitize racerKey
+    const id = racerKey.replace(/\s+/g, '').toLowerCase();
+    url = `https://vdo.ninja/?view=${id}&autoplay=1&mute=1`;
+  }
+  
+  if (reloadKey > 0) {
+    url += (url.includes('?') ? '&' : '?') + `rk=${reloadKey}`;
+  }
+  
+  vdoNinjaUrlCache.set(cacheKey, url);
+  return url;
+};
 
 const setSession = () => {
   if (sessionCodeInput.value.trim() === '') {
@@ -442,7 +535,13 @@ const connectWebSocket = () => {
             if (userSessionCode !== targetSession) {
                 return;
             }
-            
+    
+            // Check if the user is already in our manual order
+            if (isManualSort.value && !manualOrder.value.includes(user.user)) {
+                // If we're in manual mode and a NEW racer appears, add them to the end of manualOrder
+                manualOrder.value.push(user.user);
+            }
+    
             let racer = racers.value.get(user.user);
             if (!racer) {
                 console.log(`[New Racer] Tracking "${user.user}" (Session: ${userSessionCode})`);
@@ -509,7 +608,24 @@ const connectWebSocket = () => {
   };
 };
 
+const handleKeyDown = (e: KeyboardEvent) => {
+  if (e.key.toLowerCase() === 'r') {
+    if (!isManualSort.value) {
+      // Capture current order
+      manualOrder.value = sortedRacers.value.map(r => r.racerKey);
+      isManualSort.value = true;
+      console.log("Manual sort ENABLED (order locked)");
+    } else {
+      isManualSort.value = false;
+      console.log("Manual sort DISABLED (auto-sort enabled)");
+    }
+  }
+};
+
 onMounted(() => {
+  window.addEventListener('keydown', handleKeyDown);
+  window.addEventListener('resize', handleResize);
+  // ... rest of existing onMounted
   const storedSession = localStorage.getItem('sessionCode');
   if (storedSession) {
     if (confirm(`Do you want to change your event ID (currently ${storedSession})?`)) {
@@ -553,9 +669,10 @@ const resetSession = () => {
   connected.value = false;
 };
 onUnmounted(() => {
+  window.removeEventListener('keydown', handleKeyDown);
+  window.removeEventListener('resize', handleResize);
   if (socket) {
     socket.close();
-    socket = null;
   }
 });
 </script>
@@ -606,6 +723,7 @@ onUnmounted(() => {
              </div>
           </div>
           <div class="modal-footer">
+            <button class="btn-danger" @click="e => { removeRacer(managingRacerKey!, e); closeManagement(); }">Delete Participant</button>
             <button @click="closeManagement">Done</button>
           </div>
         </div>
@@ -688,19 +806,19 @@ onUnmounted(() => {
       </div>
 
       <div v-if="!connected && !error" class="connecting">Connecting to telemetry...</div>
-      <div v-else class="grid-container" :class="{ 'has-fullscreen': !!fullscreenRacerKey }" :style="{ gridTemplateColumns: `repeat(${Math.ceil(Math.sqrt(visibleRacers.length))}, 1fr)` }">
+      <div v-else class="grid-container" :class="{ 'has-fullscreen': !!fullscreenRacerKey }" :style="gridStyle">
         <div v-for="racer in visibleRacers" :key="racer.racerKey" 
              class="grid-item" 
              :class="{ finished: racer.hasFinished, inactive: !racer.isActive, fullscreen: fullscreenRacerKey === racer.racerKey, hidden: !!fullscreenRacerKey && fullscreenRacerKey !== racer.racerKey }"
              @click="toggleFullscreen(racer.racerKey)">
-          <div class="iframe-container">
+          <div class="iframe-container" :key="racer.racerKey">
             <iframe 
               :src="getVdoNinjaUrl(racer.racerKey)" 
               frameborder="0" 
               allow="autoplay; camera; microphone; fullscreen; picture-in-picture; display-capture; midi; encrypted-media; gyroscope; accelerometer"
             ></iframe>
             <div class="racer-controls" v-if="!fullscreenRacerKey">
-              <button v-if="racer.hasFinished" class="control-icon remove-icon" title="Remove Finished Racer" @click="removeRacer(racer.racerKey, $event)">
+              <button class="control-icon remove-icon" title="Remove Racer" @click="removeRacer(racer.racerKey, $event)">
                 🗑
               </button>
               <button class="control-icon gear-icon" title="Manage Racer" @click="toggleManagement(racer.racerKey, $event)">
@@ -760,6 +878,20 @@ onUnmounted(() => {
   color: white;
 }
 
+.btn-danger {
+  background: #c80000;
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.btn-danger:hover {
+  background: #ff0000;
+}
+
 .leaderboard {
   background: black;
   color: white;
@@ -778,7 +910,6 @@ onUnmounted(() => {
 
 .grid-container {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 4px;
   padding: 4px;
   width: 100vw;
@@ -788,11 +919,15 @@ onUnmounted(() => {
 
 .grid-item {
   position: relative;
-  background: #111;
+  background: #000;
   overflow: hidden;
-  aspect-ratio: 16/9;
   cursor: pointer;
   transition: transform 0.2s, z-index 0.2s;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }
 
 .grid-item.fullscreen {
@@ -948,6 +1083,9 @@ onUnmounted(() => {
   width: 100%;
   height: 100%;
   position: relative;
+  aspect-ratio: 16/9;
+  max-width: 100%;
+  max-height: 100%;
 }
 
 .iframe-container iframe {
