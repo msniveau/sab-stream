@@ -128,49 +128,95 @@ export class RacerProgressResolver {
             return;
         }
 
+        // 1. Get all unique segments in order
+        const segments: { sectionIndex: number, segmentIndex: number }[] = [];
+        graph.nodes.forEach(n => {
+            if (!segments.some(s => s.sectionIndex === n.sectionIndex && s.segmentIndex === n.segmentIndex)) {
+                segments.push({ sectionIndex: n.sectionIndex, segmentIndex: n.segmentIndex });
+            }
+        });
+
+        // Sort segments: higher index means further in progress
+        // Requirement: W1Z1 < W1Z2 < W1Z3 < W2Z1 < W2Z2 < W2Z3
+        segments.sort((a, b) => {
+            if (a.sectionIndex !== b.sectionIndex) return a.sectionIndex - b.sectionIndex;
+            return a.segmentIndex - b.segmentIndex;
+        });
+
+        const totalSegments = segments.length;
+        if (totalSegments === 0) {
+            racer.totalProgress = 0;
+            return;
+        }
+
+        // 2. Find current segment index in the flat list
+        const currentSegmentFlatIdx = segments.findIndex(s => 
+            s.sectionIndex === racer.lastConfirmedNode!.sectionIndex && 
+            s.segmentIndex === racer.lastConfirmedNode!.segmentIndex
+        );
+
+        if (currentSegmentFlatIdx === -1) {
+            racer.totalProgress = 0;
+            return;
+        }
+
+        // 3. Calculate progress within the current segment
         const currentSegmentNodes = graph.nodes.filter(n => 
             n.sectionIndex === racer.lastConfirmedNode!.sectionIndex && 
             n.segmentIndex === racer.lastConfirmedNode!.segmentIndex
-        );
+        ).sort((a, b) => a.index - b.index);
 
-        let segmentStartNode = currentSegmentNodes.find(n => n.nodeType === FlowNodeType.Start);
-        let segmentEndNode = currentSegmentNodes.find(n => n.nodeType === FlowNodeType.End || n.nodeType === FlowNodeType.Boss || n.isEndOfRace);
+        let segmentProgress = 0;
+        if (currentSegmentNodes.length > 0) {
+            const firstNode = currentSegmentNodes[0];
+            const lastNode = currentSegmentNodes[currentSegmentNodes.length - 1];
+            
+            const startIndex = firstNode.index;
+            const endIndex = lastNode.index;
+            const totalIndexRange = endIndex - startIndex;
 
-        // Fallback to global start/finish if not found in current segment (should ideally not happen with correct map)
-        if (!segmentStartNode) segmentStartNode = graph.startNodes[0];
-        if (!segmentEndNode) segmentEndNode = graph.finishNodes[0];
-        
-        if (!segmentStartNode || !segmentEndNode) {
-            racer.totalProgress = 0;
-            return;
+            if (totalIndexRange > 0) {
+                const lastIdx = racer.lastConfirmedNode.index;
+                const targetIdx = racer.currentTargetNode ? racer.currentTargetNode.index : lastIdx;
+
+                let currentSmoothIndex = lastIdx;
+                
+                // Check if we are moving within the same segment or to another one
+                const isTargetInSameSegment = racer.currentTargetNode && 
+                                             racer.currentTargetNode.sectionIndex === racer.lastConfirmedNode.sectionIndex &&
+                                             racer.currentTargetNode.segmentIndex === racer.lastConfirmedNode.segmentIndex;
+
+                if (isTargetInSameSegment) {
+                    // Standard interpolation within the same segment
+                    if (targetIdx > lastIdx) {
+                        currentSmoothIndex = lastIdx + (targetIdx - lastIdx) * racer.edgeProgress;
+                    }
+                } else if (racer.currentTargetNode) {
+                    // Moving to a DIFFERENT segment
+                    const targetSegmentFlatIdx = segments.findIndex(s => 
+                        s.sectionIndex === racer.currentTargetNode!.sectionIndex && 
+                        s.segmentIndex === racer.currentTargetNode!.segmentIndex
+                    );
+
+                    if (targetSegmentFlatIdx > currentSegmentFlatIdx) {
+                        // Moving FORWARD to a next segment: interpolate toward the END of current segment
+                        currentSmoothIndex = lastIdx + (endIndex - lastIdx) * racer.edgeProgress;
+                    } else if (targetSegmentFlatIdx < currentSegmentFlatIdx && targetSegmentFlatIdx !== -1) {
+                        // Moving BACKWARD: interpolate toward the START of current segment (or just stay at lastIdx)
+                        currentSmoothIndex = lastIdx - (lastIdx - startIndex) * racer.edgeProgress;
+                    }
+                }
+
+                segmentProgress = (currentSmoothIndex - startIndex) / totalIndexRange;
+            } else {
+                // Only one node in segment or all have same index
+                segmentProgress = 0.5; 
+            }
         }
 
-        const maxIndex = segmentEndNode.index;
-        const startIndex = segmentStartNode.index;
-        const totalIndexRange = maxIndex - startIndex;
-
-        if (totalIndexRange <= 0) {
-            racer.totalProgress = 0;
-            return;
-        }
-
-        const lastIndex = racer.lastConfirmedNode.index;
-        const targetIndex = racer.currentTargetNode ? racer.currentTargetNode.index : lastIndex;
-
-        let currentSmoothIndex = lastIndex;
-        
-        // Only interpolate if we are in the same segment
-        const isSameSegment = racer.currentTargetNode && 
-                              racer.currentTargetNode.sectionIndex === racer.lastConfirmedNode.sectionIndex &&
-                              racer.currentTargetNode.segmentIndex === racer.lastConfirmedNode.segmentIndex;
-
-        if (isSameSegment && targetIndex > lastIndex) {
-            currentSmoothIndex = lastIndex + (targetIndex - lastIndex) * racer.edgeProgress;
-        }
-
-        racer.totalProgress = (currentSmoothIndex - startIndex) / totalIndexRange;
-        
-        // Ensure totalProgress is within bounds
+        // 4. Calculate global progress
+        segmentProgress = Math.max(0, Math.min(0.999, segmentProgress)); // Keep within [0, 1) to not jump to next segment
+        racer.totalProgress = (currentSegmentFlatIdx + segmentProgress) / totalSegments;
         racer.totalProgress = Math.max(0, Math.min(1.0, racer.totalProgress));
     }
 
@@ -299,6 +345,15 @@ export class RacerProgressResolver {
         let bestNode: RuntimeNode | null = null;
         let bestDistance = Infinity;
 
+        let sampleMap: number | null = null;
+        if (sample.map !== undefined && sample.map !== null) {
+            if (typeof sample.map === 'object' && sample.map.id !== undefined) {
+                sampleMap = Number(sample.map.id);
+            } else {
+                sampleMap = Number(sample.map);
+            }
+        }
+
         for (const node of graph.nodes) {
             if (!node.isBound) continue;
             
@@ -310,7 +365,6 @@ export class RacerProgressResolver {
                 continue;
             }
 
-            const sampleMap = Number(sample.map);
             if (node.mapId !== null && node.mapId !== sampleMap) {
                 continue;
             }
@@ -491,7 +545,17 @@ export class RacerProgressResolver {
 
     private isInsideTrigger(sample: BeetleRankUserSnapshot, node: RuntimeNode): boolean {
         if (!node.isBound) return false;
-        if (node.mapId !== null && node.mapId !== Number(sample.map)) return false;
+        
+        let sampleMap: number | null = null;
+        if (sample.map !== undefined && sample.map !== null) {
+            if (typeof sample.map === 'object' && sample.map.id !== undefined) {
+                sampleMap = Number(sample.map.id);
+            } else {
+                sampleMap = Number(sample.map);
+            }
+        }
+
+        if (node.mapId !== null && node.mapId !== sampleMap) return false;
 
         const dist = this.distance3D(sample.x, sample.y, sample.z, node.worldX, node.worldY, node.worldZ);
         

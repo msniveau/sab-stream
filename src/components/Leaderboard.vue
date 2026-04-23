@@ -27,7 +27,6 @@ const handleResize = () => {
 const error = ref<string | null>(null);
 const connected = ref(false);
 const sessionCodeInput = ref('');
-const isManualSort = ref(false);
 const manualOrder = ref<string[]>([]);
 
 // Load state from localStorage
@@ -89,14 +88,54 @@ const saveSession = () => {
 
 const saveRacers = () => {
   if (sessionCode.value) {
-    const racersObj = Object.fromEntries(
-      Array.from(racers.value.entries()).map(([key, racer]) => {
-        // Create a shallow copy and remove the Map so it can be stringified
-        const { nodeProgress, ...rest } = racer;
-        return [key, rest];
+    try {
+      const racersObj = Object.fromEntries(
+        Array.from(racers.value.entries()).map(([key, racer]) => {
+        // Create a copy and sanitize circular/complex fields
+        const sanitizeNode = (node: RuntimeNode | null) => {
+          if (!node) return null;
+          // Store only the essential fields that aren't circular (no edges)
+          return {
+            id: node.id,
+            index: node.index,
+            label: node.label,
+            nodeType: node.nodeType,
+            sectionIndex: node.sectionIndex,
+            segmentIndex: node.segmentIndex,
+            worldX: node.worldX,
+            worldY: node.worldY,
+            worldZ: node.worldZ
+          };
+        };
+
+        const { 
+          nodeProgress, 
+          lastConfirmedNode, 
+          currentTargetNode,
+          pendingSplitNode,
+          candidateBranchEntryNodes,
+          activeBranchRootNode,
+          activeBranchEntryNode,
+          confirmationHistory,
+          ...rest 
+        } = racer;
+
+        return [key, {
+          ...rest,
+          confirmationHistory: confirmationHistory || [],
+          lastConfirmedNode: sanitizeNode(lastConfirmedNode),
+          currentTargetNode: sanitizeNode(currentTargetNode),
+          pendingSplitNode: sanitizeNode(pendingSplitNode),
+          candidateBranchEntryNodes: (candidateBranchEntryNodes || []).map(sanitizeNode),
+          activeBranchRootNode: sanitizeNode(activeBranchRootNode),
+          activeBranchEntryNode: sanitizeNode(activeBranchEntryNode)
+        }];
       })
     );
     localStorage.setItem(`racers_${sessionCode.value}`, JSON.stringify(racersObj));
+    } catch (e) {
+      console.error('[saveRacers] Failed to serialize racersObj:', e);
+    }
   }
 };
 
@@ -127,9 +166,8 @@ const togglePath = (racerKey: string, event: Event) => {
     
     // Find matching segment in flat list
     const foundIdx = flatSegmentGroups.value.findIndex(sg => 
-      // sectionIndex in RuntimeNode is the raw index from flowmap
-      // We need to match it against sectionGroups logic if possible, 
-      // but let's just find the first node in the segment and check its indices
+      sg.groups && sg.groups.length > 0 &&
+      sg.groups[0].nodes && sg.groups[0].nodes.length > 0 &&
       sg.groups[0].nodes[0].sectionIndex === sIdx && 
       sg.groups[0].nodes[0].segmentIndex === segIdx
     );
@@ -311,14 +349,18 @@ const sectionGroups = computed(() => {
   const sectionIndices: number[] = [];
 
   for (const group of checkpointGroups.value) {
+    if (!group || !group.nodes || group.nodes.length === 0) continue;
+    
     const firstNode = group.nodes[0];
     const sIdx = firstNode.sectionIndex;
     const segIdx = firstNode.segmentIndex;
     
+    if (sIdx === undefined || segIdx === undefined) continue;
+    
     if (!sections[sIdx]) {
       sections[sIdx] = {
-        displayName: firstNode.sectionDisplayName,
-        side: firstNode.sectionSide,
+        displayName: firstNode.sectionDisplayName || `Section ${sIdx}`,
+        side: firstNode.sectionSide || 'Right',
         segments: {}
       };
       sectionIndices.push(sIdx);
@@ -326,7 +368,7 @@ const sectionGroups = computed(() => {
     
     if (!sections[sIdx].segments[segIdx]) {
       sections[sIdx].segments[segIdx] = {
-        label: firstNode.segmentLabel,
+        label: firstNode.segmentLabel || `Segment ${segIdx}`,
         groups: []
       };
     }
@@ -351,14 +393,16 @@ const flatSegmentGroups = computed(() => {
   const sections = sectionGroups.value;
   
   sections.forEach((section, sIdx) => {
+    if (!section || !section.segments) return;
     section.segments.forEach((segment, segIdx) => {
+      if (!segment) return;
       result.push({
         sectionDisplayName: section.displayName,
         sectionSide: section.side,
         sectionIndex: sIdx, // index in sorted sections
         segmentLabel: segment.label,
         segmentIndex: segIdx, // index in sorted segments
-        groups: segment.groups
+        groups: segment.groups || []
       });
     });
   });
@@ -366,10 +410,19 @@ const flatSegmentGroups = computed(() => {
   return result;
 });
 
+const placementSortedRacers = computed(() => {
+  const allRacers = Array.from(racers.value.values());
+  return allRacers.sort((a, b) => {
+    if (a.hasFinished && !b.hasFinished) return -1;
+    if (!a.hasFinished && b.hasFinished) return 1;
+    return b.totalProgress - a.totalProgress;
+  });
+});
+
 const sortedRacers = computed(() => {
   const allRacers = Array.from(racers.value.values());
   
-  if (isManualSort.value && manualOrder.value.length > 0) {
+  if (manualOrder.value.length > 0) {
     // Return racers in the order they were when 'r' was pressed, 
     // but handle new racers that might have appeared since then
     const orderMap = new Map(manualOrder.value.map((key, index) => [key, index]));
@@ -380,22 +433,18 @@ const sortedRacers = computed(() => {
       
       if (indexA !== indexB) return indexA - indexB;
       
-      // Fallback for racers not in manualOrder
+      // Fallback for racers not in manualOrder (e.g. new ones)
       if (a.hasFinished && !b.hasFinished) return -1;
       if (!a.hasFinished && b.hasFinished) return 1;
       return b.totalProgress - a.totalProgress;
     });
   }
 
-  return allRacers.sort((a, b) => {
-    if (a.hasFinished && !b.hasFinished) return -1;
-    if (!a.hasFinished && b.hasFinished) return 1;
-    
-    const aIdx = a.totalProgress;
-    const bIdx = b.totalProgress;
-    
-    return bIdx - aIdx;
-  });
+  // Initial sort if no manualOrder yet
+  // Once the first snapshot arrives, we should ideally NOT keep updating the order
+  // if the user expects it to only update on 'r'.
+  // However, we return placementSortedRacers for now as a default starting point.
+  return placementSortedRacers.value;
 });
 
 const visibleRacers = computed(() => {
@@ -408,6 +457,14 @@ const stableVisibleRacers = computed(() => {
   return Array.from(racers.value.values())
     .filter(r => !r.isRemoved)
     .sort((a, b) => a.racerKey.localeCompare(b.racerKey));
+});
+
+const racerRanks = computed(() => {
+  const ranks: Record<string, number> = {};
+  placementSortedRacers.value.forEach((racer, index) => {
+    ranks[racer.racerKey] = index + 1;
+  });
+  return ranks;
 });
 
 const racerOrderMap = computed(() => {
@@ -545,16 +602,22 @@ const connectWebSocket = () => {
         }
 
         data.users.forEach((user: BeetleRankUserSnapshot) => {
+            if (!user || typeof user !== 'object') return;
+
             const userSessionCode = user.sessionCode !== undefined ? String(user.sessionCode) : null;
             const targetSession = sessionCode.value;
 
             if (userSessionCode !== targetSession) {
                 return;
             }
+
+            if (!user.user) {
+                console.warn('[WebSocket] Received user without user key:', user);
+                return;
+            }
     
-            // Check if the user is already in our manual order
-            if (isManualSort.value && !manualOrder.value.includes(user.user)) {
-                // If we're in manual mode and a NEW racer appears, add them to the end of manualOrder
+            // If we have a manual order and a NEW racer appears, add them to the end
+            if (manualOrder.value.length > 0 && !manualOrder.value.includes(user.user)) {
                 manualOrder.value.push(user.user);
             }
     
@@ -606,6 +669,7 @@ const connectWebSocket = () => {
         saveRacers();
     } catch (e) {
         console.error('[WebSocket] Error processing message:', e);
+        console.error('[WebSocket] Raw message that failed:', event.data);
     }
   };
 
@@ -626,15 +690,9 @@ const connectWebSocket = () => {
 
 const handleKeyDown = (e: KeyboardEvent) => {
   if (e.key.toLowerCase() === 'r') {
-    if (!isManualSort.value) {
-      // Capture current order
-      manualOrder.value = sortedRacers.value.map(r => r.racerKey);
-      isManualSort.value = true;
-      console.log("Manual sort ENABLED (order locked)");
-    } else {
-      isManualSort.value = false;
-      console.log("Manual sort DISABLED (auto-sort enabled)");
-    }
+    // Refresh current order based on progress
+    manualOrder.value = placementSortedRacers.value.map(r => r.racerKey);
+    console.log("Stream order REFRESHED based on current progress");
   }
 };
 
@@ -766,22 +824,24 @@ onUnmounted(() => {
                 <span class="tab-side">{{ sg.sectionSide }}</span>
               </button>
             </div>
-            <div v-if="flatSegmentGroups[selectedSegmentIndex]" class="checkpoint-list">
+            <div v-if="flatSegmentGroups && flatSegmentGroups[selectedSegmentIndex]" class="checkpoint-list">
               <div class="segment-container">
                 <div class="segment-header current-segment">
                   <span class="segment-label">{{ flatSegmentGroups[selectedSegmentIndex].sectionDisplayName }} - {{ flatSegmentGroups[selectedSegmentIndex].segmentLabel }}</span>
                 </div>
                 <div 
+                  v-if="flatSegmentGroups[selectedSegmentIndex].groups"
                   v-for="group in flatSegmentGroups[selectedSegmentIndex].groups" 
-                  :key="group.index + '-' + group.nodes.map((n:any)=>n.id).join('-')"
+                  :key="group.index + '-' + (group.nodes ? group.nodes.map((n:any)=>n.id).join('-') : 'empty')"
                   class="checkpoint-group"
                   :class="{ 
-                    'split-group': group.nodes.length > 1,
-                    'is-split': group.nodes.some((n: any) => n.nodeType === FlowNodeType.Split),
-                    'is-converge': group.nodes.some((n: any) => n.nodeType === FlowNodeType.Converge)
+                    'split-group': group.nodes && group.nodes.length > 1,
+                    'is-split': group.nodes && group.nodes.some((n: any) => n.nodeType === FlowNodeType.Split),
+                    'is-converge': group.nodes && group.nodes.some((n: any) => n.nodeType === FlowNodeType.Converge)
                   }"
                 >
                   <div 
+                    v-if="group.nodes"
                     v-for="node in group.nodes" 
                     :key="node.id"
                     class="checkpoint-item"
@@ -853,10 +913,17 @@ onUnmounted(() => {
             </div>
             <div class="racer-overlay" v-if="!fullscreenRacerKey">
               <div class="racer-info-line">
-                <div class="racer-rank">#{{ sortedRacers.indexOf(racer) + 1 }}</div>
+                <div class="racer-rank">#{{ racerRanks[racer.racerKey] }}</div>
                 <div class="racer-name">{{ getDisplayName(racer.racerKey) }}</div>
               </div>
-              <div class="racer-progress">{{ (racer.totalProgress * 100).toFixed(1) }}%</div>
+              <div class="racer-details">
+                <div class="racer-progress">
+                  {{ (racer.totalProgress * 100).toFixed(1) }}%
+                  <span class="racer-segment-inline" v-if="racer.lastConfirmedNode">
+                    - {{ racer.lastConfirmedNode.segmentLabel }}
+                  </span>
+                </div>
+              </div>
             </div>
             <div v-if="fullscreenRacerKey === racer.racerKey" class="fullscreen-close">×</div>
           </div>
@@ -1039,18 +1106,31 @@ onUnmounted(() => {
   color: #fff;
 }
 
+.racer-details {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  background: linear-gradient(transparent 0%, rgba(0, 0, 0, 0.4) 40%, rgba(0, 0, 0, 0.9) 100%);
+  margin: 0 -10px -5px -10px;
+  padding: 15px 15px 8px 15px;
+  width: calc(100% + 20px);
+  box-sizing: border-box;
+}
+
+
+.racer-segment-inline {
+  font-size: 0.85em;
+  color: #ccc;
+  font-weight: 600;
+  text-shadow: 0 0 8px rgba(0, 0, 0, 1);
+}
+
 .racer-progress {
   font-size: 1em;
   color: #eee;
   font-weight: 700;
   text-shadow: 0 0 8px rgba(0, 0, 0, 1);
-  align-self: flex-end;
-  background: linear-gradient(transparent 0%, rgba(0, 0, 0, 0.4) 40%, rgba(0, 0, 0, 0.9) 100%);
-  margin: 0 -10px -5px -10px;
-  padding: 15px 15px 8px 15px;
-  width: 100%;
   text-align: right;
-  box-sizing: border-box;
 }
 
 .racer-controls {
