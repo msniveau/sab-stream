@@ -107,6 +107,9 @@ export interface RacerRuntimeState {
     
     totalProgress: number;
     isRemoved?: boolean;
+    lastX?: number;
+    lastY?: number;
+    lastZ?: number;
     confirmedNodes: string[]; // List of confirmed node IDs
     skippedNodes: string[]; // List of skipped node IDs
     nodeProgress: Map<string, number>; // Progress weight for each node ID

@@ -117,11 +117,17 @@ const saveRacers = () => {
           activeBranchRootNode,
           activeBranchEntryNode,
           confirmationHistory,
+          lastX,
+          lastY,
+          lastZ,
           ...rest 
         } = racer;
 
         return [key, {
           ...rest,
+          lastX,
+          lastY,
+          lastZ,
           confirmationHistory: confirmationHistory || [],
           lastConfirmedNode: sanitizeNode(lastConfirmedNode),
           currentTargetNode: sanitizeNode(currentTargetNode),
@@ -637,6 +643,9 @@ const connectWebSocket = () => {
                     hasFinished: false,
                     statusText: "Initializing",
                     lastUpdateUtc: Date.now(),
+                    lastX: user.x,
+                    lastY: user.y,
+                    lastZ: user.z,
                     awaitingBranchDecision: false,
                     pendingSplitNode: null,
                     candidateBranchEntryNodes: [],

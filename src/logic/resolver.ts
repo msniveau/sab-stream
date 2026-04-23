@@ -42,6 +42,11 @@ export class RacerProgressResolver {
         racer.isActive = sample.active;
         racer.lastUpdateUtc = Date.now();
 
+        // Update basic telemetry fields that should always reflect latest data
+        racer.lastX = sample.x;
+        racer.lastY = sample.y;
+        racer.lastZ = sample.z;
+
         if (!racer.lastConfirmedNode) {
             // Attempt to re-anchor first before initializing at start
             const reanchorNode = this.findBestReanchorNode(graph, sample);
@@ -105,14 +110,14 @@ export class RacerProgressResolver {
         }
 
         // Normal forward confirmation
-        if (this.isInsideTrigger(sample, racer.currentTargetNode)) {
+        if (this.isInsideTrigger(racer, sample, racer.currentTargetNode)) {
             console.log(`[Resolver] "${racer.racerName}" confirmed node ${racer.currentTargetNode.label}`);
             this.confirmNode(graph, racer, racer.currentTargetNode, `Confirmed ${racer.currentTargetNode.label}`);
             return;
         }
 
         // Update interpolated progress
-        racer.edgeProgress = this.computeEdgeProgress(racer.lastConfirmedNode, racer.currentTargetNode, sample);
+        racer.edgeProgress = this.computeEdgeProgress(racer, racer.lastConfirmedNode, racer.currentTargetNode, sample);
         this.updateTotalProgress(graph, racer);
         racer.statusText = `Moving toward ${racer.currentTargetNode.label}`;
     }
@@ -298,7 +303,7 @@ export class RacerProgressResolver {
 
     private handlePendingSplitDecision(graph: RuntimeGraph, racer: RacerRuntimeState, sample: BeetleRankUserSnapshot): void {
         for (const candidate of racer.candidateBranchEntryNodes) {
-            if (this.isInsideTrigger(sample, candidate)) {
+            if (this.isInsideTrigger(racer, sample, candidate)) {
                 racer.lastConfirmedNode = candidate;
                 this.addHistory(racer, candidate);
                 
@@ -543,7 +548,7 @@ export class RacerProgressResolver {
         return false;
     }
 
-    private isInsideTrigger(sample: BeetleRankUserSnapshot, node: RuntimeNode): boolean {
+    private isInsideTrigger(racer: RacerRuntimeState, sample: BeetleRankUserSnapshot, node: RuntimeNode): boolean {
         if (!node.isBound) return false;
         
         let sampleMap: number | null = null;
@@ -557,22 +562,28 @@ export class RacerProgressResolver {
 
         if (node.mapId !== null && node.mapId !== sampleMap) return false;
 
-        const dist = this.distance3D(sample.x, sample.y, sample.z, node.worldX, node.worldY, node.worldZ);
+        const x = sample.x !== undefined ? sample.x : (racer.lastX ?? 0);
+        const y = sample.y !== undefined ? sample.y : (racer.lastY ?? 0);
+        const z = sample.z !== undefined ? sample.z : (racer.lastZ ?? 0);
+
+        const dist = this.distance3D(x, y, z, node.worldX, node.worldY, node.worldZ);
         
         // Apply hysteresis: if it's the current target, use a slightly larger radius to prevent flickering
         const threshold = node.triggerRadius * RacerProgressResolver.HysteresisRadiusFactor;
         return dist <= threshold;
     }
 
-    private computeEdgeProgress(from: RuntimeNode, to: RuntimeNode, sample: BeetleRankUserSnapshot): number {
+    private computeEdgeProgress(racer: RacerRuntimeState, from: RuntimeNode, to: RuntimeNode, sample: BeetleRankUserSnapshot): number {
         const totalDist = this.distance3D(from.worldX, from.worldY, from.worldZ, to.worldX, to.worldY, to.worldZ);
         if (totalDist < 0.001) return 0;
 
-        const distToTarget = this.distance3D(sample.x, sample.y, sample.z, to.worldX, to.worldY, to.worldZ);
+        const x = sample.x !== undefined ? sample.x : (racer.lastX ?? 0);
+        const y = sample.y !== undefined ? sample.y : (racer.lastY ?? 0);
+        const z = sample.z !== undefined ? sample.z : (racer.lastZ ?? 0);
+
+        const distToTarget = this.distance3D(x, y, z, to.worldX, to.worldY, to.worldZ);
 
         // Progress is 1.0 when at target, and decreases as we move away.
-        // If distance to target is equal to total distance, we are at the start node (0.0).
-        // If distance to target is larger than total distance, progress will be negative (walking backwards).
         return 1.0 - (distToTarget / totalDist);
     }
 
