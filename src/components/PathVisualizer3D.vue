@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted, watch } from 'vue';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { simplifyFlowmap, SimplifiedFlowmap } from '../logic/flowmap-simplifier';
+import { simplifyFlowmap, SimplifiedFlowmap, SimplifiedCheckpoint } from '../logic/flowmap-simplifier';
 import { PathCalculator } from '../logic/path-calculator';
 import { BeetleRankSnapshot } from '../logic/types';
 import flowmapJson from '../../flowmap.json';
@@ -131,12 +131,12 @@ function renderFlowmap() {
   ];
 
   zones.forEach(([zoneName, zone], zoneIndex) => {
-    if (!zone) return;
+    if (!zone || typeof zone === 'string') return;
 
     const color = colors[zoneIndex % colors.length];
 
     // Draw checkpoints as spheres
-    Object.entries(zone.checkpoints).forEach(([checkpointId, checkpoint]) => {
+    Object.entries(zone.checkpoints).forEach(([checkpointId, checkpoint]: [string, SimplifiedCheckpoint]) => {
       const geometry = new THREE.SphereGeometry(5, 16, 16);
       const material = new THREE.MeshStandardMaterial({ color });
       const sphere = new THREE.Mesh(geometry, material);
@@ -170,7 +170,7 @@ function renderFlowmap() {
       }
 
       // Draw lines to next checkpoints
-      checkpoint.next.forEach(nextId => {
+      checkpoint.next.forEach((nextId: string) => {
         const nextCheckpoint = getCheckpointFromFlowmap(nextId);
         if (nextCheckpoint) {
           const points = [

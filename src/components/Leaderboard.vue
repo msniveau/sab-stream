@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch, reactive } from 'vue';
 import { BeetleRankSnapshot, BeetleRankUserSnapshot, RuntimeGraph, RuntimeNode, RacerRuntimeState, RacerOverride, FlowNodeType } from '../logic/types';
-import { RacerProgressResolver } from '../logic/resolver';
 import { parseFlowmap } from '../logic/parser';
 import { simplifyFlowmap } from '../logic/flowmap-simplifier';
 import { PathCalculator } from '../logic/path-calculator';
@@ -234,7 +233,6 @@ const updateOverride = (racerKey: string, field: 'displayName' | 'vdoNinjaId', v
   overrides.value[racerKey][field] = value;
 };
 
-const resolver = new RacerProgressResolver();
 let graph: RuntimeGraph | null = null;
 let pathCalculator: PathCalculator | null = null;
 let socket: WebSocket | null = null;
@@ -980,7 +978,7 @@ onUnmounted(() => {
         <button class="menu-btn" @click="handleKeyDown({ key: 'r', preventDefault: () => {} } as KeyboardEvent)" title="Sort streams by progress">
           📊 Sort (R)
         </button>
-        <button class="menu-btn" @click="$emit('switch-view')" title="Open 3D path viewer">
+        <button class="menu-btn" @click="emit('switch-view')" title="Open 3D path viewer">
           🗺️ 3D View (Tab)
         </button>
         <button class="menu-btn btn-ghost" @click="resetSession" title="Change event session">

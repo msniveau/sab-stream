@@ -208,7 +208,7 @@ export class RacerProgressResolver {
                     // If target is a SPLIT/CONVERGE node (not in our checkpoint list), find the next real checkpoint
                     if (targetNodePosInSegment === -1 && (racer.currentTargetNode.nodeType === FlowNodeType.Split || racer.currentTargetNode.nodeType === FlowNodeType.Converge)) {
                         // Find all checkpoints that come after the current position
-                        const nextCheckpoints = currentSegmentNodes.filter((n, idx) => idx > currentNodePosInSegment);
+                        const nextCheckpoints = currentSegmentNodes.filter((_n, idx) => idx > currentNodePosInSegment);
                         if (nextCheckpoints.length > 0) {
                             // Use the first checkpoint after current position
                             targetNodePosInSegment = currentNodePosInSegment + 1;
@@ -610,26 +610,6 @@ export class RacerProgressResolver {
         racer.pendingSplitNode = null;
         racer.awaitingBranchDecision = false;
         racer.candidateBranchEntryNodes = [];
-    }
-
-    private canReach(graph: RuntimeGraph, fromNodeId: string, toNodeId: string): boolean {
-        const visited = new Set<string>();
-        const queue = [fromNodeId];
-        visited.add(fromNodeId);
-
-        while (queue.length > 0) {
-            const currentId = queue.shift()!;
-            if (currentId === toNodeId) return true;
-
-            const outgoing = graph.edges.filter(e => e.fromNodeId === currentId);
-            for (const edge of outgoing) {
-                if (!visited.has(edge.toNodeId)) {
-                    visited.add(edge.toNodeId);
-                    queue.push(edge.toNodeId);
-                }
-            }
-        }
-        return false;
     }
 
     private isInsideTrigger(racer: RacerRuntimeState, sample: BeetleRankUserSnapshot, node: RuntimeNode): boolean {

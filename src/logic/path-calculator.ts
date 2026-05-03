@@ -1,4 +1,4 @@
-import { SimplifiedFlowmap, SimplifiedCheckpoint, getCheckpointById } from './flowmap-simplifier';
+import { SimplifiedFlowmap, SimplifiedCheckpoint } from './flowmap-simplifier';
 
 interface Segment {
   fromId: string;
@@ -177,12 +177,14 @@ export class PathCalculator {
     if (!closestSegment || !closestZone) return 0;
 
     // Calculate progress within current zone
-    const distanceInZone = this.getDistanceInZone(closestZone.startId, closestSegment.fromId, closestZone.segments) +
-                          (closestSegment.length * closestT);
-    const zoneProgress = closestZone.totalLength > 0 ? distanceInZone / closestZone.totalLength : 0;
+    const zone = closestZone as ZoneInfo;
+    const segment = closestSegment as Segment;
+    const distanceInZone = this.getDistanceInZone(zone.startId, segment.fromId, zone.segments) +
+                          (segment.length * closestT);
+    const zoneProgress = zone.totalLength > 0 ? distanceInZone / zone.totalLength : 0;
 
     // Calculate how many zones completed before this one
-    const currentZoneIndex = this.zoneOrder.indexOf(closestZone.name);
+    const currentZoneIndex = this.zoneOrder.indexOf(zone.name);
     let completedZonesLength = 0;
     for (let i = 0; i < currentZoneIndex; i++) {
       const zone = this.zones.get(this.zoneOrder[i]);
@@ -193,10 +195,10 @@ export class PathCalculator {
 
     // Total progress = (completed zones + current zone progress) / total length
     const totalLength = Array.from(this.zones.values()).reduce((sum, z) => sum + z.totalLength, 0);
-    const totalDistance = completedZonesLength + (zoneProgress * closestZone.totalLength);
+    const totalDistance = completedZonesLength + (zoneProgress * zone.totalLength);
     const overallProgress = totalLength > 0 ? (totalDistance / totalLength) * 100 : 0;
 
-    console.log(`[Progress] Zone: ${closestZone.name}, zoneProgress: ${(zoneProgress * 100).toFixed(1)}%, overall: ${overallProgress.toFixed(1)}%`);
+    console.log(`[Progress] Zone: ${zone.name}, zoneProgress: ${(zoneProgress * 100).toFixed(1)}%, overall: ${overallProgress.toFixed(1)}%`);
 
     return overallProgress;
   }
