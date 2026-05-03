@@ -95,7 +95,7 @@ export interface RacerRuntimeState {
     statusText: string;
     lastUpdateUtc: number;
     sessionCode: number | string;
-    
+
     // Internal state for logic
     awaitingBranchDecision: boolean;
     pendingSplitNode: RuntimeNode | null;
@@ -104,14 +104,22 @@ export interface RacerRuntimeState {
     activeBranchEntryNode: RuntimeNode | null; // The node where the branch was entered
     branchLocked: boolean; // Flag to lock once a branch is chosen
     branchLockReason: string;
-    
+
     totalProgress: number;
+    sectionProgress: number;
+    segmentProgress: number;
     isRemoved?: boolean;
+
+    worldX?: number;
+    worldY?: number;
+    worldZ?: number;
     lastX?: number;
     lastY?: number;
     lastZ?: number;
-    confirmedNodes: string[]; // List of confirmed node IDs
-    skippedNodes: string[]; // List of skipped node IDs
-    nodeProgress: Map<string, number>; // Progress weight for each node ID
+    currentMapId?: number;
+
     confirmationHistory: string[]; // List of confirmed node IDs (limited to 20)
+    confirmedNodes: string[]; // List of all confirmed node IDs
+    skippedNodes: string[]; // List of skipped node IDs (passed but not triggered)
+    nodeProgress: Map<string, number>;
 }

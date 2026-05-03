@@ -3,7 +3,13 @@ import { ref, onMounted, onUnmounted, computed, watch, reactive } from 'vue';
 import { BeetleRankSnapshot, BeetleRankUserSnapshot, RuntimeGraph, RuntimeNode, RacerRuntimeState, RacerOverride, FlowNodeType } from '../logic/types';
 import { RacerProgressResolver } from '../logic/resolver';
 import { parseFlowmap } from '../logic/parser';
+import { simplifyFlowmap } from '../logic/flowmap-simplifier';
+import { PathCalculator } from '../logic/path-calculator';
 import flowmapJson from '../../flowmap.json';
+
+const emit = defineEmits<{
+  'switch-view': []
+}>();
 
 const racers = ref<Map<string, RacerRuntimeState>>(new Map());
 const overrides = ref<Record<string, RacerOverride>>({});
@@ -230,6 +236,7 @@ const updateOverride = (racerKey: string, field: 'displayName' | 'vdoNinjaId', v
 
 const resolver = new RacerProgressResolver();
 let graph: RuntimeGraph | null = null;
+let pathCalculator: PathCalculator | null = null;
 let socket: WebSocket | null = null;
 
   const checkpointGroups = computed(() => {
@@ -419,38 +426,36 @@ const flatSegmentGroups = computed(() => {
 const placementSortedRacers = computed(() => {
   const allRacers = Array.from(racers.value.values());
   return allRacers.sort((a, b) => {
+    // Finished racers come first
     if (a.hasFinished && !b.hasFinished) return -1;
     if (!a.hasFinished && b.hasFinished) return 1;
+
+    // Sort by total progress (path-based calculation)
     return b.totalProgress - a.totalProgress;
   });
 });
 
 const sortedRacers = computed(() => {
   const allRacers = Array.from(racers.value.values());
-  
+
   if (manualOrder.value.length > 0) {
-    // Return racers in the order they were when 'r' was pressed, 
+    // Return racers in the order they were when 'r' was pressed,
     // but handle new racers that might have appeared since then
     const orderMap = new Map(manualOrder.value.map((key, index) => [key, index]));
-    
+
     return allRacers.sort((a, b) => {
       const indexA = orderMap.has(a.racerKey) ? orderMap.get(a.racerKey)! : 10000;
       const indexB = orderMap.has(b.racerKey) ? orderMap.get(b.racerKey)! : 10000;
-      
+
       if (indexA !== indexB) return indexA - indexB;
-      
-      // Fallback for racers not in manualOrder (e.g. new ones)
-      if (a.hasFinished && !b.hasFinished) return -1;
-      if (!a.hasFinished && b.hasFinished) return 1;
-      return b.totalProgress - a.totalProgress;
+
+      // Fallback for racers not in manualOrder (e.g. new ones) - keep stable order
+      return a.racerKey.localeCompare(b.racerKey);
     });
   }
 
-  // Initial sort if no manualOrder yet
-  // Once the first snapshot arrives, we should ideally NOT keep updating the order
-  // if the user expects it to only update on 'r'.
-  // However, we return placementSortedRacers for now as a default starting point.
-  return placementSortedRacers.value;
+  // No manual order - keep stable order by racer key (arrival order essentially)
+  return allRacers.sort((a, b) => a.racerKey.localeCompare(b.racerKey));
 });
 
 const visibleRacers = computed(() => {
@@ -640,6 +645,8 @@ const connectWebSocket = () => {
                     currentTargetNode: null,
                     edgeProgress: 0,
                     totalProgress: 0,
+                    sectionProgress: 0,
+                    segmentProgress: 0,
                     hasFinished: false,
                     statusText: "Initializing",
                     lastUpdateUtc: Date.now(),
@@ -666,10 +673,26 @@ const connectWebSocket = () => {
                 racer.lastUpdateUtc = Date.now();
                 racer.colorHex = user.color || racer.colorHex;
 
-                if (graph) {
-                    resolver.applyTelemetry(graph, racer, user);
+                // Update position
+                racer.lastX = user.x;
+                racer.lastY = user.y;
+                racer.lastZ = user.z;
+
+                // Update progress using path calculator (position-based, no checkpoint triggers needed)
+                if (pathCalculator && user.x !== undefined && user.y !== undefined && user.z !== undefined) {
+                    const progress = pathCalculator.getProgress(user.x, user.y, user.z);
+                    racer.totalProgress = progress / 100; // Convert to 0-1 range
+                    racer.sectionProgress = progress / 100;
+                    racer.segmentProgress = progress / 100;
+                    racer.statusText = `${progress.toFixed(1)}% complete`;
+
+                    // Check if finished (>99% progress)
+                    if (progress >= 99 && !racer.hasFinished) {
+                        racer.hasFinished = true;
+                        racer.statusText = "Finished";
+                    }
                 } else {
-                    racer.statusText = (user as any).status || "Racing (No Graph)";
+                    racer.statusText = "Racing";
                 }
             }
         });
@@ -699,6 +722,7 @@ const connectWebSocket = () => {
 
 const handleKeyDown = (e: KeyboardEvent) => {
   if (e.key.toLowerCase() === 'r') {
+    e.preventDefault();
     // Refresh current order based on progress
     manualOrder.value = placementSortedRacers.value.map(r => r.racerKey);
     console.log("Stream order REFRESHED based on current progress");
@@ -706,7 +730,8 @@ const handleKeyDown = (e: KeyboardEvent) => {
 };
 
 onMounted(() => {
-  window.addEventListener('keydown', handleKeyDown);
+  // Use capture phase to catch the event even when iframe is focused
+  window.addEventListener('keydown', handleKeyDown, true);
   window.addEventListener('resize', handleResize);
   // ... rest of existing onMounted
   const storedSession = localStorage.getItem('sessionCode');
@@ -722,6 +747,17 @@ onMounted(() => {
     if (graph) {
       console.log("Flowmap loaded and parsed", graph.layoutName);
     }
+
+    // Generate and log simplified flowmap
+    const simplified = simplifyFlowmap(flowmapJson);
+    console.log("Simplified Flowmap:", simplified);
+
+    // Initialize path calculator
+    pathCalculator = new PathCalculator(simplified);
+    console.log("PathCalculator initialized");
+
+    // Save to window for easy access in browser console
+    (window as any).simplifiedFlowmap = simplified;
   } catch (e) {
     console.error("Failed to parse flowmap.json", e);
   }
@@ -752,7 +788,7 @@ const resetSession = () => {
   connected.value = false;
 };
 onUnmounted(() => {
-  window.removeEventListener('keydown', handleKeyDown);
+  window.removeEventListener('keydown', handleKeyDown, true);
   window.removeEventListener('resize', handleResize);
   if (socket) {
     socket.close();
@@ -898,10 +934,11 @@ onUnmounted(() => {
              :style="{ order: racerOrderMap[racer.racerKey] }"
              @click="toggleFullscreen(racer.racerKey)">
           <div class="iframe-container">
-            <iframe 
-              :src="getVdoNinjaUrl(racer.racerKey)" 
-              frameborder="0" 
+            <iframe
+              :src="getVdoNinjaUrl(racer.racerKey)"
+              frameborder="0"
               allow="autoplay; camera; microphone; fullscreen; picture-in-picture; display-capture; midi; encrypted-media; gyroscope; accelerometer"
+              style="pointer-events: none;"
             ></iframe>
             <div class="racer-controls" v-if="!fullscreenRacerKey">
               <button class="control-icon remove-icon" title="Remove Racer" @click="removeRacer(racer.racerKey, $event)">
@@ -927,7 +964,7 @@ onUnmounted(() => {
               </div>
               <div class="racer-details">
                 <div class="racer-progress">
-                  {{ (racer.totalProgress * 100).toFixed(1) }}%
+                  {{ (racer.totalProgress * 100).toFixed(1) }}% | 
                   <span class="racer-segment-inline" v-if="racer.lastConfirmedNode">
                     - {{ racer.lastConfirmedNode.segmentLabel }}
                   </span>
@@ -939,35 +976,65 @@ onUnmounted(() => {
         </div>
       </div>
       <div v-if="connected && visibleRacers.length === 0 && !fullscreenRacerKey" class="no-data">No racers tracked for this session</div>
-      <div v-if="sessionCode && !fullscreenRacerKey" class="footer-controls">
-          <button class="btn-small btn-ghost" @click="resetSession">Change Session ({{ sessionCode }})</button>
+      <div v-if="sessionCode && !fullscreenRacerKey" class="hover-menu">
+        <button class="menu-btn" @click="handleKeyDown({ key: 'r', preventDefault: () => {} } as KeyboardEvent)" title="Sort streams by progress">
+          📊 Sort (R)
+        </button>
+        <button class="menu-btn" @click="$emit('switch-view')" title="Open 3D path viewer">
+          🗺️ 3D View (Tab)
+        </button>
+        <button class="menu-btn btn-ghost" @click="resetSession" title="Change event session">
+          🔄 Change Session
+        </button>
       </div>
     </template>
   </div>
 </template>
 
 <style scoped>
-.footer-controls {
+.hover-menu {
   position: fixed;
   bottom: 10px;
   right: 10px;
   z-index: 1000;
   opacity: 0.1;
   transition: opacity 0.3s;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
-.footer-controls:hover {
+.hover-menu:hover {
   opacity: 1;
 }
 
+.menu-btn {
+  background: rgba(0, 0, 0, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: white;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85em;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+
+.menu-btn:hover {
+  background: rgba(50, 50, 50, 0.95);
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: translateX(-2px);
+}
+
 .btn-ghost {
-  background: rgba(0,0,0,0.5);
-  border: 1px solid rgba(255,255,255,0.2);
-  color: #888;
+  background: rgba(0, 0, 0, 0.5);
+  border-color: rgba(255, 255, 255, 0.2);
+  color: #aaa;
 }
 
 .btn-ghost:hover {
-  background: rgba(0,0,0,0.8);
+  background: rgba(0, 0, 0, 0.8);
   color: white;
 }
 

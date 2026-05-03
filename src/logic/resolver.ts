@@ -1,18 +1,18 @@
-import { 
+import {
     RuntimeGraph, RuntimeNode,
     BeetleRankUserSnapshot, RacerRuntimeState,
-    FlowNodeType 
+    FlowNodeType
 } from './types';
 
 export class RacerProgressResolver {
-    private static readonly ReanchorRadiusFactor = 0.5; // Increased for better self-healing
-    private static readonly ReanchorRadiusMax = 10.0; // Increased for better self-healing
-    private static readonly HysteresisRadiusFactor = 1.2; // Stay inside a bit longer to prevent flickering
+    private static readonly ReanchorRadiusFactor = 0.35; 
+    private static readonly ReanchorRadiusMax = 6.0; 
+    private static readonly HysteresisRadiusFactor = 1.0; 
 
     public initializeAtStart(graph: RuntimeGraph, racer: RacerRuntimeState): void {
-        const firstStart = graph.nodes.find((n: RuntimeNode) => n.nodeType === FlowNodeType.Start);
+        const firstStart = graph.nodes.find((n: RuntimeNode) => n.isBound && n.nodeType === FlowNodeType.Start);
         if (!firstStart) {
-            console.error("Graph has no start node.");
+            console.error("Graph has no bound start node.");
             return;
         }
 
@@ -21,6 +21,8 @@ export class RacerProgressResolver {
         racer.currentTargetNode = firstEdge ? graph.nodes.find((n: RuntimeNode) => n.id === (firstEdge as any).toNodeId) || null : null;
         racer.edgeProgress = 0;
         racer.totalProgress = 0;
+        racer.sectionProgress = 0;
+        racer.segmentProgress = 0;
         racer.statusText = "Initialized";
         racer.hasFinished = false;
         racer.awaitingBranchDecision = false;
@@ -36,6 +38,7 @@ export class RacerProgressResolver {
         racer.nodeProgress = new Map<string, number>();
         
         this.addHistory(racer, firstStart);
+        this.updateTotalProgress(graph, racer);
     }
 
     public applyTelemetry(graph: RuntimeGraph, racer: RacerRuntimeState, sample: BeetleRankUserSnapshot): void {
@@ -65,34 +68,11 @@ export class RacerProgressResolver {
 
         // Global strict re-anchor pass
         const reanchorNode = this.findBestReanchorNode(graph, sample);
-        if (reanchorNode) {
-            // Only re-anchor if it represents progress (higher index) 
-            // OR if the distance to current target is significantly worse than reanchorNode
-            const currentIndex = racer.lastConfirmedNode?.index ?? -1;
-            
-            let shouldReanchor = reanchorNode.index > currentIndex;
-
-            // Self-healing: if we are far from our current path, re-anchor even if index is lower
-            if (!shouldReanchor) {
-                const distToLast = this.distance3D(sample.x, sample.y, sample.z, racer.lastConfirmedNode.worldX, racer.lastConfirmedNode.worldY, racer.lastConfirmedNode.worldZ);
-                const distToTarget = racer.currentTargetNode ? this.distance3D(sample.x, sample.y, sample.z, racer.currentTargetNode.worldX, racer.currentTargetNode.worldY, racer.currentTargetNode.worldZ) : Infinity;
-                
-                const currentPathDist = Math.min(distToLast, distToTarget);
-                const reanchorRadius = this.getReanchorRadius(reanchorNode);
-                
-                // If we are more than 3x the reanchor radius away from our current path, but inside another trigger, 
-                // OR we are at index 0 (initial start) but found a later checkpoint (handled by reanchorNode.index > currentIndex above)
-                if (currentPathDist > reanchorRadius * 3) {
-                    shouldReanchor = true;
-                    console.log(`[Resolver] Self-healing "${racer.racerName}" to ${reanchorNode.label} (Current path distance: ${currentPathDist.toFixed(2)})`);
-                }
-            }
-
-            if (shouldReanchor) {
-                console.log(`[Resolver] Re-anchoring "${racer.racerName}" to ${reanchorNode.label} (ID: ${reanchorNode.id}, Index: ${reanchorNode.index})`);
-                this.reanchorToNode(graph, racer, reanchorNode);
-                return;
-            }
+        if (reanchorNode && reanchorNode.id !== racer.lastConfirmedNode.id) {
+            console.log(`[Resolver] Re-anchoring "${racer.racerName}" to ${reanchorNode.label} (ID: ${reanchorNode.id}, Index: ${reanchorNode.index})`);
+            racer.hasFinished = false; // Reset finished status on re-anchor
+            this.reanchorToNode(graph, racer, reanchorNode);
+            return;
         }
 
         // Handle pending split decision
@@ -112,6 +92,7 @@ export class RacerProgressResolver {
         // Normal forward confirmation
         if (this.isInsideTrigger(racer, sample, racer.currentTargetNode)) {
             console.log(`[Resolver] "${racer.racerName}" confirmed node ${racer.currentTargetNode.label}`);
+            racer.hasFinished = false; // Reset finished status if we confirm a node
             this.confirmNode(graph, racer, racer.currentTargetNode, `Confirmed ${racer.currentTargetNode.label}`);
             return;
         }
@@ -125,24 +106,37 @@ export class RacerProgressResolver {
     private updateTotalProgress(graph: RuntimeGraph, racer: RacerRuntimeState): void {
         if (racer.hasFinished) {
             racer.totalProgress = 1.0;
+            racer.sectionProgress = 1.0;
+            racer.segmentProgress = 1.0;
             return;
         }
 
         if (!racer.lastConfirmedNode) {
             racer.totalProgress = 0;
+            racer.sectionProgress = 0;
+            racer.segmentProgress = 0;
             return;
         }
 
-        // 1. Get all unique segments in order
-        const segments: { sectionIndex: number, segmentIndex: number }[] = [];
+        // If awaiting branch decision at a split, don't update progress
+        // Keep the last known progress until branch is selected
+        if (racer.awaitingBranchDecision) {
+            return;
+        }
+
+        // 1. Get all unique sections and segments from bound checkpoints
+        const segmentMap = new Map<string, { sectionIndex: number, segmentIndex: number }>();
         graph.nodes.forEach(n => {
-            if (!segments.some(s => s.sectionIndex === n.sectionIndex && s.segmentIndex === n.segmentIndex)) {
-                segments.push({ sectionIndex: n.sectionIndex, segmentIndex: n.segmentIndex });
+            if (n.isBound && (n.nodeType === FlowNodeType.Checkpoint || n.nodeType === FlowNodeType.Start || n.nodeType === FlowNodeType.End || n.nodeType === FlowNodeType.Boss)) {
+                const key = `${n.sectionIndex}_${n.segmentIndex}`;
+                if (!segmentMap.has(key)) {
+                    segmentMap.set(key, { sectionIndex: n.sectionIndex, segmentIndex: n.segmentIndex });
+                }
             }
         });
+        const segments = Array.from(segmentMap.values());
 
         // Sort segments: higher index means further in progress
-        // Requirement: W1Z1 < W1Z2 < W1Z3 < W2Z1 < W2Z2 < W2Z3
         segments.sort((a, b) => {
             if (a.sectionIndex !== b.sectionIndex) return a.sectionIndex - b.sectionIndex;
             return a.segmentIndex - b.segmentIndex;
@@ -151,77 +145,118 @@ export class RacerProgressResolver {
         const totalSegments = segments.length;
         if (totalSegments === 0) {
             racer.totalProgress = 0;
+            racer.sectionProgress = 0;
+            racer.segmentProgress = 0;
             return;
         }
 
-        // 2. Find current segment index in the flat list
-        const currentSegmentFlatIdx = segments.findIndex(s => 
-            s.sectionIndex === racer.lastConfirmedNode!.sectionIndex && 
+        // 2. Find current segment and section indices
+        const currentSegmentFlatIdx = segments.findIndex(s =>
+            s.sectionIndex === racer.lastConfirmedNode!.sectionIndex &&
             s.segmentIndex === racer.lastConfirmedNode!.segmentIndex
         );
 
         if (currentSegmentFlatIdx === -1) {
             racer.totalProgress = 0;
+            racer.sectionProgress = 0;
+            racer.segmentProgress = 0;
             return;
         }
 
+        const currentSectionIndex = racer.lastConfirmedNode!.sectionIndex;
+        const segmentsInSection = segments.filter(s => s.sectionIndex === currentSectionIndex);
+        const currentSegmentInSectionIdx = segmentsInSection.findIndex(s => s.segmentIndex === racer.lastConfirmedNode!.segmentIndex);
+
         // 3. Calculate progress within the current segment
-        const currentSegmentNodes = graph.nodes.filter(n => 
-            n.sectionIndex === racer.lastConfirmedNode!.sectionIndex && 
-            n.segmentIndex === racer.lastConfirmedNode!.segmentIndex
-        ).sort((a, b) => a.index - b.index);
+        // Get all checkpoints in this segment sorted by their flow order
+        // Important: START nodes must come first, then sort by index, then END nodes last
+        const currentSegmentNodes = graph.nodes.filter(n =>
+            n.sectionIndex === racer.lastConfirmedNode!.sectionIndex &&
+            n.segmentIndex === racer.lastConfirmedNode!.segmentIndex &&
+            n.isBound &&
+            (n.nodeType === FlowNodeType.Checkpoint || n.nodeType === FlowNodeType.Start || n.nodeType === FlowNodeType.End || n.nodeType === FlowNodeType.Boss)
+        ).sort((a, b) => {
+            // START nodes always come first
+            if (a.nodeType === FlowNodeType.Start && b.nodeType !== FlowNodeType.Start) return -1;
+            if (b.nodeType === FlowNodeType.Start && a.nodeType !== FlowNodeType.Start) return 1;
+
+            // END/BOSS nodes always come last
+            const aIsEnd = a.nodeType === FlowNodeType.End || a.nodeType === FlowNodeType.Boss;
+            const bIsEnd = b.nodeType === FlowNodeType.End || b.nodeType === FlowNodeType.Boss;
+            if (aIsEnd && !bIsEnd) return 1;
+            if (bIsEnd && !aIsEnd) return -1;
+
+            // Otherwise sort by index
+            return a.index - b.index;
+        });
 
         let segmentProgress = 0;
         if (currentSegmentNodes.length > 0) {
-            const firstNode = currentSegmentNodes[0];
-            const lastNode = currentSegmentNodes[currentSegmentNodes.length - 1];
-            
-            const startIndex = firstNode.index;
-            const endIndex = lastNode.index;
-            const totalIndexRange = endIndex - startIndex;
+            // Find position of current checkpoint in the segment
+            const currentNodePosInSegment = currentSegmentNodes.findIndex(n => n.id === racer.lastConfirmedNode!.id);
 
-            if (totalIndexRange > 0) {
-                const lastIdx = racer.lastConfirmedNode.index;
-                const targetIdx = racer.currentTargetNode ? racer.currentTargetNode.index : lastIdx;
+            if (currentNodePosInSegment !== -1) {
+                // Progress is based on: (currentPosition + edgeProgress) / (totalCheckpoints - 1)
+                // This ensures: first checkpoint (pos 0) = 0%, last checkpoint (pos N-1) = 100%
+                const totalCheckpointsMinusOne = Math.max(1, currentSegmentNodes.length - 1);
 
-                let currentSmoothIndex = lastIdx;
-                
-                // Check if we are moving within the same segment or to another one
-                const isTargetInSameSegment = racer.currentTargetNode && 
-                                             racer.currentTargetNode.sectionIndex === racer.lastConfirmedNode.sectionIndex &&
-                                             racer.currentTargetNode.segmentIndex === racer.lastConfirmedNode.segmentIndex;
+                // Add interpolated progress to next checkpoint if we have a target
+                let smoothPosition = currentNodePosInSegment;
+                if (racer.currentTargetNode) {
+                    let targetNodePosInSegment = currentSegmentNodes.findIndex(n => n.id === racer.currentTargetNode!.id);
 
-                if (isTargetInSameSegment) {
-                    // Standard interpolation within the same segment
-                    if (targetIdx > lastIdx) {
-                        currentSmoothIndex = lastIdx + (targetIdx - lastIdx) * racer.edgeProgress;
+                    // If target is a SPLIT/CONVERGE node (not in our checkpoint list), find the next real checkpoint
+                    if (targetNodePosInSegment === -1 && (racer.currentTargetNode.nodeType === FlowNodeType.Split || racer.currentTargetNode.nodeType === FlowNodeType.Converge)) {
+                        // Find all checkpoints that come after the current position
+                        const nextCheckpoints = currentSegmentNodes.filter((n, idx) => idx > currentNodePosInSegment);
+                        if (nextCheckpoints.length > 0) {
+                            // Use the first checkpoint after current position
+                            targetNodePosInSegment = currentNodePosInSegment + 1;
+                        }
                     }
-                } else if (racer.currentTargetNode) {
-                    // Moving to a DIFFERENT segment
-                    const targetSegmentFlatIdx = segments.findIndex(s => 
-                        s.sectionIndex === racer.currentTargetNode!.sectionIndex && 
-                        s.segmentIndex === racer.currentTargetNode!.segmentIndex
-                    );
 
-                    if (targetSegmentFlatIdx > currentSegmentFlatIdx) {
-                        // Moving FORWARD to a next segment: interpolate toward the END of current segment
-                        currentSmoothIndex = lastIdx + (endIndex - lastIdx) * racer.edgeProgress;
-                    } else if (targetSegmentFlatIdx < currentSegmentFlatIdx && targetSegmentFlatIdx !== -1) {
-                        // Moving BACKWARD: interpolate toward the START of current segment (or just stay at lastIdx)
-                        currentSmoothIndex = lastIdx - (lastIdx - startIndex) * racer.edgeProgress;
+                    // Only add edge progress if target is in the same segment and ahead of us
+                    if (targetNodePosInSegment > currentNodePosInSegment) {
+                        // Edge progress represents our position between current and target
+                        smoothPosition = currentNodePosInSegment + racer.edgeProgress;
                     }
                 }
 
-                segmentProgress = (currentSmoothIndex - startIndex) / totalIndexRange;
-            } else {
-                // Only one node in segment or all have same index
-                segmentProgress = 0.5; 
+                segmentProgress = smoothPosition / totalCheckpointsMinusOne;
+
+                // Debug logging for all checkpoints
+                console.log(`[Progress Debug] ${racer.racerName}:`, {
+                    currentNode: racer.lastConfirmedNode.label,
+                    currentNodeType: racer.lastConfirmedNode.nodeType,
+                    currentPos: currentNodePosInSegment,
+                    targetNode: racer.currentTargetNode?.label,
+                    targetPos: racer.currentTargetNode ? currentSegmentNodes.findIndex(n => n.id === racer.currentTargetNode!.id) : 'none',
+                    edgeProgress: racer.edgeProgress,
+                    smoothPosition,
+                    totalCheckpointsMinusOne,
+                    segmentProgress: segmentProgress,
+                    sectionProgress: (currentSegmentInSectionIdx + segmentProgress) / segmentsInSection.length,
+                    totalProgress: (currentSegmentFlatIdx + segmentProgress) / totalSegments,
+                    currentSegmentFlatIdx,
+                    totalSegments
+                });
             }
         }
 
-        // 4. Calculate global progress
-        segmentProgress = Math.max(0, Math.min(0.999, segmentProgress)); // Keep within [0, 1) to not jump to next segment
+        segmentProgress = Math.max(0, Math.min(0.9999, segmentProgress));
+        racer.segmentProgress = segmentProgress;
+
+        // 4. Calculate section progress
+        if (segmentsInSection.length > 0) {
+            racer.sectionProgress = (currentSegmentInSectionIdx + segmentProgress) / segmentsInSection.length;
+        } else {
+            racer.sectionProgress = 0;
+        }
+
+        // 5. Calculate global progress
         racer.totalProgress = (currentSegmentFlatIdx + segmentProgress) / totalSegments;
+
+        racer.sectionProgress = Math.max(0, Math.min(1.0, racer.sectionProgress));
         racer.totalProgress = Math.max(0, Math.min(1.0, racer.totalProgress));
     }
 
@@ -250,7 +285,7 @@ export class RacerProgressResolver {
 
         // Re-evaluate skipped nodes when a node is confirmed
         const checkpoints = graph.nodes
-            .filter(n => n.nodeType === FlowNodeType.Checkpoint || n.nodeType === FlowNodeType.Start || n.nodeType === FlowNodeType.End || n.nodeType === FlowNodeType.Boss)
+            .filter(n => n.isBound && (n.nodeType === FlowNodeType.Checkpoint || n.nodeType === FlowNodeType.Start || n.nodeType === FlowNodeType.End || n.nodeType === FlowNodeType.Boss))
             .filter(n => {
                 // Node is globally before confirmedNode
                 if (n.sectionIndex < confirmedNode.sectionIndex) return true;
@@ -288,9 +323,20 @@ export class RacerProgressResolver {
         if (outgoing.length === 0) {
             racer.currentTargetNode = null;
             racer.edgeProgress = 1.0;
-            racer.hasFinished = true;
-            racer.totalProgress = 1.0;
-            racer.statusText = "Finished";
+            
+            // Only mark as finished if it's explicitly an end node or end of race
+            if (confirmedNode.isEndOfRace || 
+                confirmedNode.nodeType === FlowNodeType.End || 
+                confirmedNode.nodeType === FlowNodeType.Boss) {
+                racer.hasFinished = true;
+                racer.totalProgress = 1.0;
+                racer.sectionProgress = 1.0;
+                racer.segmentProgress = 1.0;
+                racer.statusText = "Finished";
+            } else {
+                racer.statusText = `${statusText} - end of segment`;
+                this.updateTotalProgress(graph, racer);
+            }
             return;
         }
 
@@ -305,6 +351,7 @@ export class RacerProgressResolver {
         for (const candidate of racer.candidateBranchEntryNodes) {
             if (this.isInsideTrigger(racer, sample, candidate)) {
                 racer.lastConfirmedNode = candidate;
+                racer.hasFinished = false; // Reset finished status if we confirm a node
                 this.addHistory(racer, candidate);
                 
                 if (!racer.confirmedNodes.includes(candidate.id)) {
@@ -330,8 +377,16 @@ export class RacerProgressResolver {
                 if (outgoing.length === 0) {
                     racer.currentTargetNode = null;
                     racer.edgeProgress = 1.0;
-                    racer.hasFinished = true;
-                    racer.statusText = "Finished";
+                    
+                    if (candidate.isEndOfRace || 
+                        candidate.nodeType === FlowNodeType.End || 
+                        candidate.nodeType === FlowNodeType.Boss) {
+                        racer.hasFinished = true;
+                        racer.statusText = "Finished";
+                    } else {
+                        racer.statusText = `Branch confirmed at ${candidate.label} - end of segment`;
+                        this.updateTotalProgress(graph, racer);
+                    }
                     return;
                 }
 
@@ -377,9 +432,8 @@ export class RacerProgressResolver {
             const dist = this.distance3D(sample.x, sample.y, sample.z, node.worldX, node.worldY, node.worldZ);
             const reanchorRadius = this.getReanchorRadius(node);
 
-            // Favor higher indices if multiple nodes are within range
             if (dist <= reanchorRadius) {
-                if (!bestNode || node.index > bestNode.index || (node.index === bestNode.index && dist < bestDistance)) {
+                if (dist < bestDistance) {
                     bestDistance = dist;
                     bestNode = node;
                 }
@@ -422,11 +476,21 @@ export class RacerProgressResolver {
         if (outgoing.length === 0) {
             racer.currentTargetNode = null;
             racer.edgeProgress = 1.0;
-            racer.hasFinished = true;
-            racer.statusText = `Re-anchored to finish node ${node.label}`;
+            
+            if (node.isEndOfRace || 
+                node.nodeType === FlowNodeType.End || 
+                node.nodeType === FlowNodeType.Boss) {
+                racer.hasFinished = true;
+                racer.statusText = `Re-anchored to finish node ${node.label}`;
+            } else {
+                racer.hasFinished = false;
+                racer.statusText = `Re-anchored to ${node.label} - end of segment`;
+                this.updateTotalProgress(graph, racer);
+            }
             return;
         }
 
+        racer.hasFinished = false;
         const nextEdge = outgoing[0];
         racer.currentTargetNode = graph.nodes.find((n: RuntimeNode) => n.id === (nextEdge as any).toNodeId) || null;
         racer.edgeProgress = 0;
@@ -505,14 +569,34 @@ export class RacerProgressResolver {
         if (!racer.confirmationHistory) {
             racer.confirmationHistory = [];
         }
-        
+
         if (racer.confirmationHistory.length === 0 || racer.confirmationHistory[racer.confirmationHistory.length - 1] !== node.id) {
             racer.confirmationHistory.push(node.id);
         }
-        
+
         if (racer.confirmationHistory.length > 20) {
             racer.confirmationHistory.shift();
         }
+    }
+
+    private canReach(graph: RuntimeGraph, fromNodeId: string, toNodeId: string): boolean {
+        const visited = new Set<string>();
+        const queue = [fromNodeId];
+        visited.add(fromNodeId);
+
+        while (queue.length > 0) {
+            const currentId = queue.shift()!;
+            if (currentId === toNodeId) return true;
+
+            const outgoing = graph.edges.filter((e: any) => e.fromNodeId === currentId);
+            for (const edge of outgoing) {
+                if (!visited.has(edge.toNodeId)) {
+                    visited.add(edge.toNodeId);
+                    queue.push(edge.toNodeId);
+                }
+            }
+        }
+        return false;
     }
 
     private clearBranchLock(racer: RacerRuntimeState): void {
@@ -574,17 +658,31 @@ export class RacerProgressResolver {
     }
 
     private computeEdgeProgress(racer: RacerRuntimeState, from: RuntimeNode, to: RuntimeNode, sample: BeetleRankUserSnapshot): number {
-        const totalDist = this.distance3D(from.worldX, from.worldY, from.worldZ, to.worldX, to.worldY, to.worldZ);
-        if (totalDist < 0.001) return 0;
-
         const x = sample.x !== undefined ? sample.x : (racer.lastX ?? 0);
         const y = sample.y !== undefined ? sample.y : (racer.lastY ?? 0);
         const z = sample.z !== undefined ? sample.z : (racer.lastZ ?? 0);
 
-        const distToTarget = this.distance3D(x, y, z, to.worldX, to.worldY, to.worldZ);
+        // Vector from -> to
+        const dx = to.worldX - from.worldX;
+        const dy = to.worldY - from.worldY;
+        const dz = to.worldZ - from.worldZ;
+        const edgeLengthSq = dx * dx + dy * dy + dz * dz;
 
-        // Progress is 1.0 when at target, and decreases as we move away.
-        return 1.0 - (distToTarget / totalDist);
+        if (edgeLengthSq < 0.001) return 0;
+
+        // Vector from -> sample
+        const sx = x - from.worldX;
+        const sy = y - from.worldY;
+        const sz = z - from.worldZ;
+
+        // Dot product to find projection
+        const dot = sx * dx + sy * dy + sz * dz;
+        let t = dot / edgeLengthSq;
+
+        // Clamp t to [0, 1]
+        t = Math.max(0, Math.min(1.0, t));
+
+        return t;
     }
 
     private getReanchorRadius(node: RuntimeNode): number {
