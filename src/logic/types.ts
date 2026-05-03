@@ -109,6 +109,7 @@ export interface RacerRuntimeState {
     sectionProgress: number;
     segmentProgress: number;
     isRemoved?: boolean;
+    isManual?: boolean;
 
     worldX?: number;
     worldY?: number;

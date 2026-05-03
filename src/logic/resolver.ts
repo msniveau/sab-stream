@@ -50,6 +50,14 @@ export class RacerProgressResolver {
         racer.lastY = sample.y;
         racer.lastZ = sample.z;
 
+        const currentMapId = sample.map !== undefined ? (typeof sample.map === 'object' ? sample.map.id : sample.map) : undefined;
+        racer.currentMapId = currentMapId;
+
+        if (currentMapId === 935) {
+            racer.statusText = "In Hub / Loading";
+            return;
+        }
+
         if (!racer.lastConfirmedNode) {
             // Attempt to re-anchor first before initializing at start
             const reanchorNode = this.findBestReanchorNode(graph, sample);

@@ -59,6 +59,10 @@ const loadState = () => {
           const rd = racerData as any;
           const racer: RacerRuntimeState = {
             ...rd,
+            totalProgress: rd.totalProgress,
+            sectionProgress: rd.sectionProgress,
+            segmentProgress: rd.segmentProgress,
+            isManual: rd.isManual || false,
             lastConfirmedNode: rd.lastConfirmedNode ? graph!.nodes.find(n => n.id === rd.lastConfirmedNode.id) || null : null,
             currentTargetNode: rd.currentTargetNode ? graph!.nodes.find(n => n.id === rd.currentTargetNode.id) || null : null,
             pendingSplitNode: rd.pendingSplitNode ? graph!.nodes.find(n => n.id === rd.pendingSplitNode.id) || null : null,
@@ -133,6 +137,7 @@ const saveRacers = () => {
           lastX,
           lastY,
           lastZ,
+          isManual: racer.isManual || false,
           confirmationHistory: confirmationHistory || [],
           lastConfirmedNode: sanitizeNode(lastConfirmedNode),
           currentTargetNode: sanitizeNode(currentTargetNode),
@@ -422,8 +427,13 @@ const flatSegmentGroups = computed(() => {
 });
 
 const placementSortedRacers = computed(() => {
-  const allRacers = Array.from(racers.value.values());
+  const allRacers = Array.from(racers.value.values()).filter(r => !r.isRemoved);
   return allRacers.sort((a, b) => {
+    // Manual racers always come last
+    if (a.isManual && !b.isManual) return 1;
+    if (!a.isManual && b.isManual) return -1;
+    if (a.isManual && b.isManual) return a.racerKey.localeCompare(b.racerKey);
+
     // Finished racers come first
     if (a.hasFinished && !b.hasFinished) return -1;
     if (!a.hasFinished && b.hasFinished) return 1;
@@ -434,7 +444,7 @@ const placementSortedRacers = computed(() => {
 });
 
 const sortedRacers = computed(() => {
-  const allRacers = Array.from(racers.value.values());
+  const allRacers = Array.from(racers.value.values()).filter(r => !r.isRemoved);
 
   if (manualOrder.value.length > 0) {
     // Return racers in the order they were when 'r' was pressed,
@@ -568,6 +578,61 @@ const getVdoNinjaUrl = (racerKey: string) => {
   return url;
 };
 
+const addManualRacer = () => {
+  const name = prompt("Enter racer name/key:");
+  if (!name || name.trim() === '') return;
+  
+  const racerKey = `manual_${Date.now()}_${name.trim().toLowerCase().replace(/\s+/g, '_')}`;
+  
+  if (racers.value.has(racerKey)) {
+    alert("A racer with this key already exists.");
+    return;
+  }
+
+  const racer = reactive({
+    racerKey: racerKey,
+    racerName: name.trim(),
+    sessionCode: sessionCode.value || "manual",
+    colorHex: "#FFFFFF",
+    isActive: true,
+    isManual: true,
+    lastConfirmedNode: null,
+    currentTargetNode: null,
+    edgeProgress: 0,
+    totalProgress: 0,
+    sectionProgress: 0,
+    segmentProgress: 0,
+    hasFinished: false,
+    statusText: "Manual Participant",
+    lastUpdateUtc: Date.now(),
+    awaitingBranchDecision: false,
+    pendingSplitNode: null,
+    candidateBranchEntryNodes: [],
+    activeBranchRootNode: null,
+    activeBranchEntryNode: null,
+    branchLocked: false,
+    branchLockReason: "",
+    confirmedNodes: [],
+    skippedNodes: [],
+    confirmationHistory: [],
+    nodeProgress: new Map<string, number>()
+  } as RacerRuntimeState);
+
+  racers.value.set(racerKey, racer);
+  
+  // Set default display name override
+  if (!overrides.value[racerKey]) {
+    overrides.value[racerKey] = { displayName: name.trim() };
+  }
+  
+  saveRacers();
+  
+  // Open management for the new racer
+  managingRacerKey.value = racerKey;
+  isManaging.value = true;
+};
+
+
 const setSession = () => {
   if (sessionCodeInput.value.trim() === '') {
     return;
@@ -667,6 +732,8 @@ const connectWebSocket = () => {
             }
             
             if (racer) {
+                if (racer.isManual) return; // Skip updating manual racers via telemetry
+                
                 racer.isActive = user.active;
                 racer.lastUpdateUtc = Date.now();
                 racer.colorHex = user.color || racer.colorHex;
@@ -675,6 +742,15 @@ const connectWebSocket = () => {
                 racer.lastX = user.x;
                 racer.lastY = user.y;
                 racer.lastZ = user.z;
+                
+                const currentMapId = user.map !== undefined ? (typeof user.map === 'object' ? user.map.id : user.map) : undefined;
+                racer.currentMapId = currentMapId;
+
+                // Skip progression update if in hub (map 935)
+                if (currentMapId === 935) {
+                    racer.statusText = "In Hub / Loading";
+                    return;
+                }
 
                 // Update progress using path calculator (position-based, no checkpoint triggers needed)
                 if (pathCalculator && user.x !== undefined && user.y !== undefined && user.z !== undefined) {
@@ -957,15 +1033,15 @@ onUnmounted(() => {
             </div>
             <div class="racer-overlay" v-if="!fullscreenRacerKey">
               <div class="racer-info-line">
-                <div class="racer-rank">#{{ racerRanks[racer.racerKey] }}</div>
+                <div v-if="!racer.isManual" class="racer-rank">#{{ racerRanks[racer.racerKey] }}</div>
                 <div class="racer-name">{{ getDisplayName(racer.racerKey) }}</div>
               </div>
               <div class="racer-details">
-                <div class="racer-progress">
-                  {{ (racer.totalProgress * 100).toFixed(1) }}% | 
-                  <span class="racer-segment-inline" v-if="racer.lastConfirmedNode">
-                    - {{ racer.lastConfirmedNode.segmentLabel }}
-                  </span>
+                <div class="racer-progress" v-if="!racer.isManual">
+                  {{ (racer.totalProgress * 100).toFixed(1) }}%
+                </div>
+                <div class="racer-progress" v-else>
+                  {{ racer.statusText }}
                 </div>
               </div>
             </div>
@@ -975,6 +1051,9 @@ onUnmounted(() => {
       </div>
       <div v-if="connected && visibleRacers.length === 0 && !fullscreenRacerKey" class="no-data">No racers tracked for this session</div>
       <div v-if="sessionCode && !fullscreenRacerKey" class="hover-menu">
+        <button class="menu-btn" @click="addManualRacer" title="Add a racer without telemetry">
+          ➕ Add Manual
+        </button>
         <button class="menu-btn" @click="handleKeyDown({ key: 'r', preventDefault: () => {} } as KeyboardEvent)" title="Sort streams by progress">
           📊 Sort (R)
         </button>
@@ -1772,4 +1851,5 @@ li.inactive {
   color: #888;
   padding: 20px 0;
 }
+
 </style>
